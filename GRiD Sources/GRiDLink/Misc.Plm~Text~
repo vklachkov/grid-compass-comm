@@ -1,0 +1,220 @@
+$TITLE ('Miscellaneout routines to aid debugging')
+$COMPACT 
+$OPTIMIZE(3) PAGEWIDTH(96) SET(misc)
+
+Misc: DO;
+
+$INCLUDE (``Incs`PlmLits.Inc~Text~)
+$INCLUDE (``IncsOs`Os.Constant.Inc~Text~)
+$INCLUDE (``IncsOs`Os.Type.Inc~Text~)
+
+	/* This is from Console.ext.inc */
+
+ConLineOut : PROCEDURE (pBuf, length) EXTERNAL;
+    DCL pBuf PTR;
+    DCL length WORD;
+    END;
+
+ConHexOut : PROCEDURE (num) EXTERNAL;
+    DCL num WORD;
+    END;
+
+ConCharOut : PROCEDURE (char) EXTERNAL;
+    DCL char BYTE;
+    END;
+
+ConCharIn : PROCEDURE BYTE EXTERNAL; END;
+
+	/* This is from cp.misc.ext.inc */
+
+ConResetDisplay: PROCEDURE EXTERNAL; END;
+
+CpAddressOf : PROCEDURE PTR EXTERNAL;
+  END;
+
+
+DCL pPromVariables 	PTR,
+	PromVariables	BASED pPromVariables 	PromVariablesType ;
+
+DCL (startTime, stopTime, elapsedTime)	DWORD;
+
+
+NewLine: PROCEDURE CLEAN;
+	DCL msg CharStr (cr,lf);
+	CALL ConLineOut (@msg, size(msg));
+END NewLine;
+
+
+HexOut: PROCEDURE (b) CLEAN;
+DCL b WORD;
+	CALL ConCharOUt (' ');
+	CALL ConHexOut (b);
+END HexOut;
+
+
+HexDwordOut: PROCEDURE (dW) CLEAN;
+DCL dW DWORD;
+DCL (highW, lowW) WORD AT (@dW);
+
+	CALL HexOut (highW);
+	CALL ConHexOut (lowW);
+END HexDwordOut;
+
+
+HexToChar: PROCEDURE (h) BYTE CLEAN;
+DCL h BYTE;
+	IF h < 0Ah THEN RETURN (h + '0');
+	ELSE RETURN (h + ('A' - 0ah));
+END HexToChar;
+
+
+HexByteOut: PROCEDURE (b) CLEAN;
+DCL b BYTE;
+	CALL ConCharOut (' ');
+	CALL ConCharOut (HexToChar (SHR (b,4)));
+	CALL ConCharOut (HexToChar (b AND 0fh));
+END HexByteOut;
+
+
+DecimalOut: PROCEDURE (n) CLEAN;
+DCL n DWORD;
+DCL digit BYTE;
+DCL divisor DWORD;
+DCL leading0s BOOLEAN;
+
+	CALL ConCharOut (' ');
+	divisor = 10000000;
+	leading0s = TRUE;
+
+	DO WHILE (divisor > 1);
+		digit = n / divisor;
+
+		IF (digit <> 0) OR (NOT leading0s) THEN
+			DO;
+			leading0s = false;
+			CALL ConCharOut ('0' + digit);
+			END;
+
+		n = n - (digit * divisor);
+		divisor = divisor / 10;
+		END;
+
+	CALL ConCharOut ('0' + n);
+END DecimalOut;
+
+
+PointerOut: PROCEDURE (p) CLEAN;
+DCL p POINTER;
+DCL pInWOrds STRUCTURE (low WORD, high WORD) AT (@p);
+	CALL HexOut (pInWords.high);
+	CALL ConCharout(':');
+	CALL ConHexOut (pInWOrds.low);
+END PointerOut;
+
+
+SelectorOut: PROCEDURE (s) CLEAN;
+DCL s 	SELECTOR;
+DCL w	WORD AT (@s);
+	CALL HexOut (w);
+END SelectorOut;
+
+
+InitTiming: PROCEDURE CLEAN;
+	pPromVariables = CpAddressOf;
+END;
+
+
+
+SetStartTime: PROCEDURE CLEAN;
+	startTime = promVariables.sysCounter;
+END;
+
+
+SetStopTime: PROCEDURE CLEAN;
+	stopTime = promVariables.sysCounter;
+END;
+
+
+PrintTimings: PROCEDURE CLEAN;
+	DCL msg1 CharStr (                '      Request Sent at:     '),
+		msg2 CharStr ('       ',cr,lf,'      Response Received at:'),
+		msg3 CharStr ('       ',cr,lf,'      Elapsed time in ms:');
+	DCL msg CharStr  ('       ',cr,lf,
+	 				'Hit any key to continue                        ',cr,lf,
+					'                                               ',cr);
+	DCL ch BYTE;
+
+	IF startTime <> 0 THEN
+		DO;
+		CALL ConLIneOut (@msg1, size(msg1));
+		CALL HexDwordOut (StartTime);
+		CALL ConLIneOut (@msg2, size(msg2));
+		CALL HexDwordOut (StopTime);
+		CALL ConLIneOut (@msg3, size(msg3));
+		CALL DecimalOut (StopTime-startTime);
+		END;
+
+	CALL ConLineOut (@msg, size(msg));
+	ch = ConCharIn;
+	CALL ConResetDisplay;
+	StartTime = 0;
+END PrintTimings;
+
+
+ConHexIn: PROCEDURE WORD CLEAN;
+DCL n			BYTE;
+DCL ch			BYTE;
+DCL needInput	BOOLEAN;
+DCL hexValue	WORD;
+
+	needInput = TRUE;
+	n = 0;
+	hexValue = 0;
+	DO WHILE needInput;
+		ch = ConCharIn;
+		IF (ch = bs) AND (n > 0) THEN
+			DO;
+			CALL ConCharOut (bs);
+			CALL ConCharOut (' ');
+			CALL ConCharOut (bs);
+			hexValue = SHR (hexValue, 4);
+			n = n - 1;
+			END;
+		ELSE IF ch = cr THEN
+			DO;
+			CALL ConCharOut (cr);
+			CALL ConCharOut (lf);
+			needInput = FALSE;
+			END;
+		ELSE IF (n < 4) THEN
+			DO;
+			IF (ch >= '0') AND (ch <= '9') THEN
+				DO;
+				CALL ConCharOut (ch);
+				hexValue = SHL (hexValue,4) + ch - '0';
+				n = n + 1;
+				END;
+			ELSE IF (ch >= 'a') AND (ch <= 'f') THEN
+				DO;
+				CALL ConCharOut (ch);
+				hexValue = SHL (hexValue,4) + ch - 'a' + 10;
+				n = n + 1;
+				END;
+			ELSE IF (ch >= 'A') AND (ch <= 'F') THEN
+				DO;
+				CALL ConCharOut (ch);
+				hexValue = SHL (hexValue,4) + ch - 'A' + 10;
+				n = n + 1;
+				END;
+			/* else ignore all non hex characters */
+			END;
+		/* else ignore any character other than bs or 
+		CR after 4 characters */
+
+		END; /* while */
+
+	RETURN (hexValue);
+END ConHexIn;
+
+
+END Misc;

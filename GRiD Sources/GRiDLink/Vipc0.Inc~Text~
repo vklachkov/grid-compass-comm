@@ -1,0 +1,64 @@
+NAME	RamVipc
+
+EXTRN	VipcProcess: FAR
+
+%IF (%ForRom) THEN (
+EXTRN	CpSetActiveSlot: NEAR
+EXTRN	MySlotNo: BYTE
+)FI
+
+DGROUP 	GROUP	DATA
+
+DATA	SEGMENT	BYTE PUBLIC 'DATA'
+
+ASSUME	CS:DGROUP
+;PUBLIC	RamVipcProcess
+
+;&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+;
+;   RamVipcProcess
+;
+;   VipcProcess is a forked processes.  The Os makes a long call to it
+;   and it must set it's own DS register.  Normally this is done using 
+;   load time fix-ups.  However since VipcProcess is in ROM, no fix-ups
+;   are possible there.
+;
+;   If RamVipcProcess is forked as the process, its CS when it is called
+;   by the OS is same as the the Data Segment, since this code is in DGROUP.
+;   Setting up DS is then very easy.  Call the actual Vipc Process from 
+;   here.  There will be a fix-up involved, however it will in Data
+;   segment
+;
+;&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+
+PUBLIC			RamVipcProcess
+
+RamVipcProcess		PROC	FAR
+	
+; there is no need to save the Oses DS or BP since this will never return.
+; Set up DS for the actual VipcProcess.
+
+	MOV	AX, CS			
+	MOV	DS, AX
+
+%IF (%ForRom) THEN (
+;
+; Set Slot No for Vipc Process to phonelink's slot no.
+;
+	XOR	AX, AX			; clear AH
+	MOV	AL, DS:MySlotNo		; get slot no for phonelink ROM
+
+	PUSH	AX	   		; param 1 for CpSetActiveSlot
+	CALL 	CpSetActiveSlot		; set new slot & returns old slot
+)FI
+
+; although VipcProcess is compiled as a Compact procedure, it is alright to
+; make a long call to it, since it has no parameters and it never returns.
+
+	CALL    VipcProcess		; Make a long call into ROM
+
+RamVipcProcess		ENDP
+
+DATA	ENDS
+
+	END

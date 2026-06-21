@@ -1,0 +1,17 @@
+/* GenIsFlushDone: PROCEDURE (pMachine) BYTE EXTERNAL;
+   DECLARE pMachine POINTER;
+   END;
+*/
+
+GenMachineFailure: PROCEDURE (sMachine, pDlCB, failureCode) EXTERNAL;
+   DECLARE sMachine SELECTOR;
+   DECLARE pDlCB SELECTOR;
+   DECLARE failureCode BYTE;
+   END;
+
+GenReturnUserRequest: PROCEDURE (sMachine, pDlCB, error) EXTERNAL;
+   DECLARE sMachine SELECTOR;
+   DECLARE pDlCB SELECTOR;
+   DECLARE error WORD;
+   END;
+

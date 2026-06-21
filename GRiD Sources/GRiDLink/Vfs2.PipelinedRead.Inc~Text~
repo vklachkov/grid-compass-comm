@@ -1,0 +1,310 @@
+$EJ
+
+DCL pipeLineSize WORD EXTERNAL;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsRead
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FsRead: PROCEDURE (sVfsConnCB, pUserBuffer, pLength) WORD CLEAN;
+	DCL sVfsConnCB			SELECTOR,
+		vfsConnCB			BASED sVfsConnCB	VfsConnCBType;
+
+	DCL connID				WORD AT (@SVfsConnCB);
+
+	DCL	pUserBuffer			PTR,
+		userBuffer			BASED pUserBuffer (1) BYTE;
+
+	DCL pLength				PTR,
+		length				BASED pLength WORD;
+
+	DCL error				WORD;
+	DCL error1				WORD;
+	DCL note				WORD;
+
+	DCL ORs					WORD,		/* outstanding Requests */
+		bytesToBeRequested	WORD,
+		bytesToBeRead		WORD,
+		xfrAmt				WORD,
+		localBytes			WORD;
+
+	DCL pLocalBuffer		PTR,
+		localBuffer			BASED pLocalBuffer (1) BYTE;
+
+	DCL readReqBlk1			ReadReqType,
+		readReqBlk2			ReadReqType,
+		readReqBlk3			ReadReqType;
+
+	DCL pReadReqBlk			PTR,
+		readReqBlk			BASED pReadReqBlk	ReadReqType;
+
+	DCL reqBlkInUse			BYTE;
+	
+	DCL readRespBlk			BASED pVfsResponse ReadRespType;
+
+	DCL seqNumberExpected	WORD;
+	DCL twitchState			DWORD;
+
+$IF serverVfs
+	DCL vipcHeader			BASED pVipcResponse		VipcIfMsgType;
+$ELSE
+	DCL vipcHeader			BASED pVipcResponse		VipcMsgType;
+$ENDIF
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@(cr,lf,'READ-cid/len:'), 15);
+		CALL HexOut (connID);
+		CALL HexOut (length);
+		CALL NewLine;
+		END;
+	IF (debugMask AND Dbits_timing) <> 0 THEN CALL SetStartTime;
+$ENDIF
+
+	error = 0;
+	IF length = 0 THEN GOTO ReadExit;
+
+	IF vfsConnCB.accessType = writeAccess THEN 
+		DO;
+		error = eAccess;
+		GOTO ReadExit;
+		END;
+
+	bytesToBeRead = length;
+	length = 0;							/* now accumulate bytes read */
+
+	pLocalBuffer = vfsConnCB.pPage;
+
+	localBytes = vfsConnCB.lenBuffer - vfsConnCB.locBuffer;
+		/* for non-buffered devices, this will compute to 0 */
+
+	IF localBytes > 0 THEN
+		DO;
+			/* There is data in the local buffer, read that first */
+		xfrAmt = WMIN (localBytes, bytesToBeRead);
+		CALL MOVW (@localBuffer (vfsConnCB.locBuffer), @userBuffer, 
+        										SHR (xfrAmt, 1));
+		IF xfrAmt /* AND 01h <> 0 then move the odd byte */
+		  THEN userBuffer (xfrAmt-1) = localBuffer (vfsConnCB.locBuffer+xfrAmt-1);
+
+		vfsConnCB.locBuffer = vfsConnCB.locBuffer + xfrAmt;
+		length = length + xfrAmt;
+
+		IF (bytesToBeRead := bytesToBeRead - xfrAmt) = 0 THEN GOTO ReadExit;
+		pUserBuffer = @UserBuffer(xfrAmt);
+		END;
+
+		/* A good place to check for end of file condition. */
+
+	IF (vfsConnCB.pageRead AND (vfsConnCB.lenBuffer < pageSize))
+	    	THEN GOTO ReadExit;
+
+		/* All data from local buffer (if any) is transferred,  Now
+		flush local buffer (if any) and then if bytesToBeRead is > pageSize
+		then do direct reads into user's buffer.  For non buffered
+		devices, do direct read for rest of the data. */
+
+	IF (error := LocalFlush (sVfsConnCB)) <> 0 THEN GOTO ReadExit;
+	bytesToBeRequested = bytesToBeRead;
+
+	ORs = 0;
+	readReqBlk1.vfsDataLength	= pageSize;
+	readReqBlk1.vfsRequest 		= ddRead;
+	readReqBlk1.requestorsConnID	= sVfsConnCB;
+	readReqBlk1.serversConnID	= vfsCOnnCB.serversConnID;
+	readReqBlk1.class 			= VfsClass;
+
+	reqBlkInUse = 1;
+	CALL MovW (@readReqBlk1, @ReadReqBlk2, size(readReqBlk)/2);
+	CALL MovW (@readReqBlk1, @ReadReqBlk3, size(readReqBlk)/2);
+	vfsConnCB.respExpected = true;
+
+	twitchState = TurnTwitchOn;
+$	IF Phonelink
+	CALL VipcDisableActivityTimeout;
+$	ENDIF
+	seqNumberExpected = VfsConnCB.seqNumber + 1;
+
+	DO WHILE TRUE;
+		IF (bytesToBeRequested > 0) AND (ORs < pipeLineSize) THEN
+			DO;
+			IF reqBlkInUse = 1 THEN pReadReqBlk = @readReqBlk1;
+			ELSE IF reqBlkInUse = 2 THEN pReadReqBlk = @readReqBlk2;
+			ELSE pReadReqBlk = @readReqBlk3;
+
+			reqBlkInUse = (reqBlkInUse MOD 3) + 1;
+
+			readReqBlk.note = (vfsConnCB.SeqNumber := vfsConnCB.SeqNumber+1);
+$			IF Debugging
+			IF (debugMask AND Dbits_FsPipeLine) <> 0 THEN
+				DO;
+					DCL msg CharStr ('Remote Read Request Sent, seq#:');
+				CALL ConLineOut (@msg, size(msg));
+				CALL HexOut (readReqBlk.note);
+				CALL newline;
+				END;
+$			ENDIF
+
+	 		IF (error := VipcInternalSend (vfsConnCB.vipcConnID,
+								SIZE (readReqBlk),
+								@readReqBlk,
+								0,
+								0ffffh)) <> 0 THEN GOTO LoopExit;
+
+			IF bytesToBeRequested < pageSize THEN bytesToBeRequested = 0;
+			ELSE bytesToBeRequested = bytesToBeRequested - pageSize;
+				
+			ORs = ORs + 1;
+			END;
+
+		IF (ORs = pipeLineSize) OR (bytesToBeRequested = 0) THEN
+			DO;
+				/* Wait for ReadTimeout period for response */
+			error = WaitForVfsResponse (vfsConnCB.RespReceived,
+										vfsConnCB.vipcConnID);
+			
+			IF error <> 0 THEN 
+			 	DO;
+				ORs = 0; 
+				GOTO LoopExit;
+				END;
+			END;
+
+			/* else check if response has arrived */
+
+		ELSE note = OsWait (vfsConnCB.RespReceived, 0, @error);
+
+			/* if no response has arrived then error will be timeout,
+			go send the next request */
+
+		IF error = 0 THEN
+			DO;
+				/* response has arrived */
+			ORs = ORs - 1;
+			xfrAmt = readRespBlk.vfsDataLength;
+
+$			IF Debugging
+			IF (debugMask AND Dbits_FsPipeline) <> 0 THEN
+				DO;
+					DCL msg CharStr ('Remote Read Response, err/xfrAmt/seq#:');
+				CALL ConLineOut (@msg, size (msg));
+				CALL HexOut (readRespBlk.error);
+				CALL HexOut (xfrAmt);
+				CALL HexOut (vipcHeader.note);
+				CALL NewLine;
+				END;
+$			ENDIF
+			
+			IF vipcHeader.note = seqNumberExpected THEN 
+				DO;
+				seqNumberExpected = seqNumberExpected + 1;
+				error = readRespBlk.error;
+				END;
+			ELSE 
+				DO;
+$				IF Debugging
+				DCL msg CharStr 
+		           ('### Received Out Of Sequence Vfs Response ###',cr,lf);
+				CALL ConLineOut (@msg, size (msg));
+$				ENDIF
+				error = eOutOfSeqVfsResp;
+				END;
+
+
+			IF error <> 0 THEN
+				DO;
+				CALL VfsFreeResponseBuffer;
+				GOTO LoopExit;
+				END;
+
+				/* no error - transfer data */
+
+			IF xfrAmt <= bytesToBeRead THEN
+				DO;
+					/* Move the data received directly into the user's 
+                        buffer.  Divide cnt by 2 so that we can use MOVW */
+				CALL MovW (@ReadRespBlk.buffer, pUserBuffer, (xfrAmt / 2));
+
+					/* Now take care of the left over byte if any */
+				IF xfrAmt /* and 01h <> 0 */
+					THEN userBuffer (xfrAmt-1) 
+								= ReadRespBlk.buffer (xfrAmt-1);
+
+				length = length + xfrAmt;
+				bytesToBeRead = bytesToBeRead - xfrAmt;
+				pUserBuffer = @UserBuffer (xfrAmt);
+            	END;
+
+			ELSE
+	 			DO;
+					/* copy it in buffer page, and then copy the required 
+	                bytes to the user's buffer. */
+
+					/* divide (cnt+1) by 2 so that we can use MOVW. For odd
+                    xfrAmt one additional byte may be copied, but it doesn't
+                    matter since the file sysetm buffer page is of even
+				 	length. */
+
+				CALL MovW (@ReadRespBlk.buffer, pLocalBuffer, ((xfrAmt+1)/2));
+				CALL MOVW (@localBuffer, pUserBuffer, bytesToBeRead/2);
+
+				IF bytesToBeRead /* AND 01h <> 0 then move the odd byte */
+			 		 THEN userBuffer (bytesToBeRead-1) 
+			         				= localBuffer (bytesToBeRead-1);
+
+				length = length + bytesToBeRead;
+				vfsConnCB.locBuffer = bytesToBeRead;
+				vfsConnCB.lenBuffer = xfrAmt;
+				vfsConnCB.pageRead = TRUE;
+			  	END;
+
+			CALL VfsFreeResponseBuffer;
+
+			IF xfrAmt < pageSize THEN GOTO LoopExit; /* End Of File */
+
+			IF (ORs = 0) AND (bytesToBeRequested = 0) THEN GOTO LoopExit;
+
+			CALL TurnTwitchOff (twitchState);
+			twitchState = TurnTwitchOn;
+            END;
+
+		END;	/* Do while True */
+
+LoopExit:
+
+	DO WHILE (ORs > 0);
+		CALL TurnTwitchOff (twitchState);
+		twitchState = TurnTwitchOn;
+		error1 = WaitForVfsResponse (vfsConnCB.RespReceived,
+									vfsConnCB.vipcConnID);
+		IF error1 = 0 THEN CALL VfsFreeResponseBuffer;
+		ORs = ORs - 1;
+		END;
+
+	vfsConnCB.respExpected = false;
+	IF error = eTimeOut THEN CALL ClearSignal (vfsConnCB.RespReceived);
+
+	CALL TurnTwitchOff (twitchState);
+$	IF Phonelink
+	/* no more request outstanding, enable activity timeout */
+	CALL VipcEnableActivityTimeout;
+$	ENDIF
+
+readExit: 
+
+$	IF debugging
+	IF (debugMask AND Dbits_timing) <> 0 THEN CALL SetStopTime;
+	IF ((debugMask AND Dbits_Fs) <> 0) THEN
+		DO;
+		CALL ConLineOut (@('Read Complete-Err/Rcvd len:'), 27);
+		CALL HexOut (error);
+		CALL HexOut (length);
+		CALL NewLine;
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+		END;
+
+$	ENDIF
+
+	RETURN (error);
+END FsRead;

@@ -1,0 +1,666 @@
+$TITLE ('VFS/VIPC/DataLink Entry Point')
+$COMPACT 
+$OPTIMIZE(3) SET(EntryPoint) SET (pipeLinedRead)
+
+EntryPoint: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	This is EntryPoint. It contains the
+&	entry points for all call to VFS and VIPC.
+&
+&	All three layers Vfs, Vipc & data link:
+&
+&		ddSignOn, ddSignoff, 
+&		ddInitialize, ddDeactivate.
+&
+&	MsDos (only) Interceptor Calls
+&
+&		ddAddVfsDevice, ddGetVfsDevice, ddSetServerName, ddGetServerName
+&		ddGetPrinterAlias, ddSetPrinterAlias, ddRestoreInterrupts
+&
+&	VFS calls:
+&
+&		ddGetStatus, ddOpen, ddCLoase, ddRead, ddWrite, ddSeek,
+&		ddTruncate, ddAttach, ddDetach, ddRename, ddDelete, ddReadDesc,
+&		ddWriteDesc, ddFlush, ddSetStatus, ddChangeUserContext
+&
+&	VIPC calls:
+&
+&		ddSend, ddAttach with mode = ProcessConnectMode.
+&		ddDetach, ddGetUserInfo, ddSetStatus, ddGetLinkStatus
+&	
+&	Dlc calls:
+&	
+&		ddReadDlcCounters
+&
+&	For Debugging
+&	
+&		ddSetDebugMask 
+&
+&	currently ddGetStatus and ddSetstatus are not implemented for VIPC.
+&
+&
+&	The ddxxx constants are defined in Os.Device.Inc.
+&	Some ddxxx constants are defined in VfsVipc.Constant.Inc
+&	The modes are defined in Os.Constant.Inc~Text~
+&
+&	Author:	Rajendra Shah
+&	Start Date:	12/13/82
+&
+&	Edit History: Refer to 'z GRiDLink & PhoneLink Bogeys~Database~'
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$EJECT
+$SAVE NOLIST
+	/* My favourite Plm literals */
+
+$INCLUDE (``Incs`Plm.Inc~Text~)
+	
+	/* Os constants, types and externals */
+
+$INCLUDE (``OsIncs`Os.Error.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Constant.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Device.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+
+	/* Constants and Types */
+
+$INCLUDE (VfsVipc.Constant.Inc~Text~)
+$INCLUDE (VfsVipcConnCB.Type.Inc~Text~)
+
+	/* Externals */
+
+$INCLUDE (Vfs.Ext.Inc~Text~)
+$INCLUDE (Vipc.Ext.Inc~Text~)
+$INCLUDE (Dlc.Ext.Inc~Text~)
+
+OsWait: PROCEDURE (sid, timeLimit, pError) WORD EXTERNAL;
+    DCL sid WORD;
+    DCL timeLimit WORD;
+    DCL pError PTR;
+    END;
+
+OsSignal: PROCEDURE (sid, mode, note, pError) EXTERNAL;
+    DCL sid WORD;
+    DCL mode BYTE;
+    DCL note WORD;
+    DCL pError PTR;
+    END;
+
+$IF MsDos
+$INCLUDE (Interceptor.Ext.Inc~Text~)
+$ENDIF
+
+$IF debugging
+$INCLUDE (Debug.Inc~Text~)
+ConKeyPressed: PROCEDURE WORD EXTERNAL; END;
+
+ConHexIn : PROCEDURE WORD EXTERNAL; END;
+$ENDIF
+
+$RESTORE
+
+
+$EJECT
+$IF Phonelink
+DCL Phonelink	BOOLEAN PUBLIC INITIAL (TRUE);
+$ELSE
+DCL Phonelink	BOOLEAN PUBLIC INITIAL (FALSE);
+$ENDIF
+
+$IF pipelinedRead
+$	IF PhoneLink
+	DCL pipeLineSize WORD PUBLIC INITIAL (2);
+$	ELSE
+	DCL pipeLineSize WORD PUBLIC INITIAL (4);
+$	ENDIF
+$ENDIF
+
+$IF serverVfs OR PostOffice
+DCL sVfsLayerConnCB	SELECTOR EXTERNAL;
+$ENDIF
+
+DCL dummyError  WORD,
+	dummyNote	WORD AT (@dummyError),
+	dummyW		WORD AT (@dummyError);
+
+  	
+	/* This variable counts the number of times this driver is activated so that
+	when it starts getting deactivates, it can ignore them until the last
+	deactivate */
+
+DCL activated	 BOOLEAN INITIAL (FALSE);
+
+$IF notused
+DCL CopyrightMsg (*) BYTE DATA ('Copyright (c) 1982,1983,1984,1985',cr,lf,
+								'GRiD Systems Corporation');
+$ENDIF
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					WMin
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+WMin: PROCEDURE (a, b) WORD CLEAN;
+	DCL (a, b) WORD;
+	IF a < b THEN RETURN a;
+	ELSE RETURN b;
+END WMin;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				Virtual File System 
+&						and 
+&		Virtual Inter-Process Communication 
+&					EntryPoint
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+EntryPoint: PROCEDURE (request, pPl, pError) CLEAN;
+	DCL request		WORD;
+
+	DCL pPl			PTR,
+		pl			BASED pPl	ParamListType;
+
+	DCL pError		PTR,
+		error		BASED pError WORD;
+
+	DCL pBuffer		PTR;
+	DCL pPassword	PTR;
+	DCL length		WORD;
+	DCL numbuf		BYTE;	/* also access */
+	DCL mode		BYTE;
+
+	DCL	sConnCB		SELECTOR,
+		connID		WORD AT (@sConnCB),
+		vfsConnCB	BASED sConnCB VfsConnCBType,
+		vipcConnCB	BASED sConnCB VipcConnCBType;
+
+	sConnCB = pl.connection;
+	pBuffer	= pl.pBuffer;
+	pPassword = pl.pOverflow;
+	length	= pl.length;
+	numBuf	= pl.numbuf;			/* also used for access */
+	mode	= pl.mode;
+	error = 0;	
+
+$IF serverVFS OR PostOffice
+	IF request = ddChangeUserContext THEN sConnCB = sVfsLayerConnCB;
+$ENDIF
+
+$IF Debugging
+	IF DetailedFsMaskSet THEN
+		DO;
+		DCL msg CHarStr ('     ',cr,lf,'Request/Conn/ConnType:');
+		CALL ConLineout (@msg, size (msg));
+		CALL Hexout (request);
+		CALL HexOut (connID);
+		IF vfsConnCB.connType = 0 THEN CALL ConLineOUT (@(' VFS'), 4);
+		ELSE IF vfsConnCB.connType = 1 THEN CALL ConLineOUT (@(' VIPC'), 5);
+		ELSE CALL HexByteOut (vfsCOnnCB.connType);
+		CALL newline;
+		END;
+$ENDIF
+
+$EJECT
+	IF request = ddInitialize THEN 
+		DO;
+		IF NOT activated THEN 
+			DO;
+$IF Debugging
+			DCL GetDebugMask BOOLEAN;
+$ENDIF
+$IF (NOT MsDos) AND (NOT serverVFS) AND (NOT Phonelink)
+			CALL FigureOutSystem;
+$ENDIF
+$IF Debugging 
+			IF mode = 0FEh THEN GetDebugMask = TRUE;
+			ELSE IF ConKeyPressed THEN
+				DO;
+				DCL ch BYTE;
+				ch = ConCharIn;
+				IF ch = 'd' OR ch = 'D' THEN GetDebugMask = TRUE;
+				ELSE GetDebugMask = FALSE;
+				END;
+			ELSE GetDebugMask = FALSE;
+
+			IF GetDebugMask THEN 
+				DO;
+				DCL pipelineMsg CharStr ('Enter pipeline size (default is 1):');
+				DCL LongReadMsg CharStr 
+						('This version implements long reads',cr,lf);
+				DCL DelayMsg CharStr 
+						('Enter extra turnaround delay reqd (in ms):');
+
+				CALL ConLineOut (@DbgMasks, size (dbgMasks));
+				DebugMask = ConHexIn;		   
+    			CALL InitTiming;
+
+$				IF pipelinedRead
+					CALL ConLineOut (@pipelineMsg, size(pipelineMsg));
+					pipeLineSize = ConHexIn;
+					IF pipeLineSize = 0 THEN pipeLineSize = 1;
+$				ELSEIF LongRead
+					CALL ConLineOut (@LongReadMsg, size(LongReadMsg));
+$				ENDIF
+				END;
+$ENDIF			
+			error = VfsInitialize;
+			activated = TRUE;
+			END;
+		END;
+
+	ELSE IF request = ddDeactivate THEN
+	 	DO;
+$IF Debugging
+		IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+			CALL ConLineOut (@('Deactivate',cr,lf),12);
+$ENDIF
+		IF activated THEN
+		 	DO;
+			error = VfsTerminate;
+			IF error = 0 THEN activated = false;
+			END;
+		END;
+
+$IF Debugging
+	ELSE IF request = ddSetDebugMask THEN
+		DO;
+		DCL msg CharStr ('Current Debug Mask Is: ');
+		CALl ConLineOUt (@msg, size (msg));
+		CALL ConHexOut (debugMask);
+		CALL ConLineOut (@DbgMasks, size (dbgMasks));
+		DebugMask = ConHexIn;
+    	CALL InitTiming;			/* Useful if timing mask is set */
+		END;
+$ENDIF
+
+$IF NOT serverVfs
+	ELSE IF request = ddReadDlcCounters 
+		THEN CALL DlcReadCounters (@pl.Length, pBuffer);
+
+	ELSE IF request = ddGetUserInfo
+		THEN error = VipcGetUserInfo (@pl.Length, pBuffer);
+
+	ELSE IF request = ddGetLinkStatus
+		THEN error = VipcGetLinkStatus (@pl.Length, pBuffer);
+$ENDIF
+
+	ELSE IF request = ddSignon 
+		THEN error = VfsSignon (@pl.Length, pBuffer, pPassword);
+
+	ELSE IF request = ddSignoff THEN 
+		DO;
+$IF MsDos
+		CALL ResetInterceptor;
+$ENDIF
+		error = VfsSignOff;
+		END;
+
+$IF MsDos
+	ELSE IF request = ddAddVfsDevice 
+		THEN error = AddVfsDevice (pBuffer, length);
+
+	ELSE IF request = ddGetVfsDevice THEN pL.pBuffer = GetVfsDevice (numbuf);
+
+	ELSE IF request = ddSetServerName THEN CALL SetServername (pBuffer);
+
+	ELSE IF request = ddGetServerName THEN pL.pBuffer = GetServerName;
+
+	ELSE IF request = ddGetPrinterAlias THEN pL.pBuffer = GetPrinterAlias;
+
+	ELSE IF request = ddSetPrinterAlias 
+		THEN error = SetPrinterAlias (mode, pBuffer);
+
+	ELSE IF request = ddRestoreInterrupts
+		THEN pl.pBuffer = MsRestoreInterrupts (@error);
+	
+$ENDIF
+
+$EJECT
+	ELSE IF request = ddAttach THEN 
+	  	DO;
+$IF NOT serverVFS
+		IF mode = ProcessConnectMode THEN 
+    		DO;
+			vipcConnCB.connType = VipcConnection;
+			vipcConnCB.clientIsVfs = FALSE;
+			error = VipcConnect (sConnCB, pBuffer);
+			END;
+		
+		ELSE
+$ENDIF
+	  		error = FsAttach (sConnCB, mode, numbuf, pBuffer, pPassword);
+		END;
+			
+	ELSE 
+		DO;
+		/* For the following requests, Wait on in-use semaphore. 
+		At most one outstanding request will be permitted per 
+		connection.  Hence all calls except Attach are blocked
+		by the inUse semaphore. Attach of course creates this 
+		semaphore and detach deletes it. */
+
+		/* The inUseSemaphore field is common to VfsConnCB & VIPCCOnnCB */
+
+$IF Debugging
+		dummyNote = OsWait (vfsConnCB.inUseSema, 0, @error);
+		IF error = eTimeout THEN
+			DO;
+			DCL msg CharStr ('Waiting for inUseSema for Conn = ');
+			CALL ConLineOUt (@msg, size (msg));
+			CALL ConHexOut (connID);
+			CALL newline;
+			error = 0;
+			dummyNote = OsWait (vfsConnCB.inUseSema, 0fffffh, @dummyError);
+			END;
+$ELSE
+		dummyNote = OsWait (vfsConnCB.inUseSema, 0fffffh, @dummyError);
+$ENDIF
+
+	
+$IF NOT serverVFS
+		IF (vfsConnCB.connType = VipcConnection) THEN
+			DO;	/* IPC requests */
+			IF request = ddDetach THEN error = VipcDisconnect (sConnCB);
+			ELSE IF request = ddSend 
+				THEN error = VipcSend (ConnID, LOW (pl.position), 
+	        					HIGH (pl.position), pBuffer);
+			ELSE IF request = ddSetStatus 
+				THEN error = VipcSetStatus (sConnCB, pBuffer, length);
+			ELSE error = eNotSupport;
+			END;
+
+$EJECT
+		ELSE
+$ENDIF
+			DO;		/* VFS requests */
+			IF request = ddRemoteCopy 
+		    	THEN error = FsRemoteCopy (sConnCB, pBuffer);
+
+			ELSE IF request = ddSetStatus 
+		    	THEN error = FsSetStatus (sConnCB, pBuffer, length);
+
+$IF serverVfs OR PostOffice
+			ELSE IF request = ddChangeUserContext 
+				THEN error = FsChangeUserContext (pBuffer, length);
+$ENDIF
+
+			ELSE IF request > ddFlush THEN error = eNotSupport;
+
+			ELSE DO CASE (request - ddGetStatus);
+					
+		    	error = FsGetStatus (sConnCB, pBuffer, length);
+
+				error = FsOpen (sConnCB, numBuf);
+
+				error = FsClose (sConnCB);
+
+				IF vfsConnCB.objectMode <> 0 
+				  	THEN error = FsDirRead (sConnCB, pBuffer, @pl.length);
+					ELSE error = FsRead    (sConnCB, pBuffer, @pl.length);
+
+				error = FsWrite (sConnCB, pBuffer, length);
+
+				IF vfsConnCB.objectMode <> 0 
+					THEN error = FsDirSeek (sConnCB, mode, pl.position);
+					ELSE error = FsSeek    (sConnCB, mode, pl.position);
+
+				error = FsTruncate (sConnCB);
+
+				;	/* Attach */
+
+    			error = FsDeleteOrDetach (ddDetach, sConnCB);
+
+				error = FsRename (sConnCB, pBuffer);
+
+    			error = FsDeleteOrDetach (ddDelete, sConnCB);
+
+				DO;	/* Read Descriptor */
+$IF Debugging
+				IF (DebugMask AND Dbits_Fs) <> 0 
+			      THEN CALL ConLineOut (@('ReadDescriptor: '), 16);
+$ENDIF
+				pl.length = maxDescLen - 2;
+				error = RemoteRead (DOUBLE (ddReadDesc), sConnCB, 
+                        						pBuffer,
+										@pl.length);
+$IF Debugging
+				IF (DebugMask AND Dbits_Fs) <> 0 THEN 
+					DO;
+					CALL ConLineOut (@('ReadDescriptor Complete'), 23);
+					CALL HexOut (error);
+					CALL NewLine;
+					END;
+$ENDIF
+				END;
+
+				DO;	/* writeDescriptor */
+$IF Debugging
+				IF (DebugMask AND Dbits_Fs) <> 0 
+			      THEN CALL ConLineOut (@('WriteDescriptor: '), 17);
+$ENDIF
+				error = RemoteWrite (DOUBLE (ddWriteDesc),sConnCB,
+										pBuffer,
+										maxDescLen - 2);
+$IF Debugging
+				IF (DebugMask AND Dbits_Fs) <> 0 THEN 
+					DO;
+					CALL ConLineOut (@('WriteDescriptor Complete'), 24);
+					CALL HexOut (error);
+					CALL NewLine;
+					END;
+$ENDIF
+				END;
+
+				DO;	/* FsFlushAllBuffers */
+				IF (error := LocalFlush (sConnCB)) = 0 THEN
+					DO;
+$IF Debugging
+					IF (DebugMask AND Dbits_Fs) <> 0 THEN 
+						DO;
+						CALL ConLineOut (@('Flush'), 5);
+						CALL HexOut (connID);
+						CALL NewLine;
+						END;
+					error = RemoteGeneral (DOUBLE (ddFlush), sConnCB);
+					IF (DebugMask AND Dbits_Fs) <> 0 THEN 
+						DO;
+						CALL ConLineOut (@('Flush Complete:'), 15);
+						CALL HexOut (error);
+						CALL NewLine;
+						END;
+$ELSE
+					error = RemoteGeneral (DOUBLE (ddFlush), sConnCB);
+$ENDIF
+					END;
+				END;	/* FsFlushAllBuffers */
+				END;	/* case */
+			END;	/* VFS Requests */
+
+		IF (request <> ddDetach) AND (request <> ddDelete) 
+			THEN CALL OsSignal (vfsConnCB.inUseSema, signalNormal, 
+						0, @dummyError);
+
+		END;	
+
+$IF Debugging
+	IF (debugMask AND Dbits_DetailedFs) <> 0 THEN
+		DO;
+		DCL msg CHarStr ('Request Complete req/connID/error/dummyError =');
+		CALL ConLineout (@msg, size (msg));
+		CALL Hexout (request);
+		CALL Hexout (connID);
+		CALL Hexout (error);
+		CALL Hexout (dummyError);
+		CALL newline;
+		END;
+$ENDIF
+END EntryPoint; /* OsRemoteFileSystem */
+
+
+$IF MsDos
+$EJECT
+$IF Debugging
+$INCLUDE (MsCalls.Int.Ext.Inc~Text~)
+$INCLUDE (``Incs`MsDos.Constant.Inc~Text~)
+$ENDIF
+
+DCL cpMachine		LIT '0';	/* from MsCall.Ext.Inc */
+MsGetMachineType: PROCEDURE BYTE EXTERNAL; END;
+MsReplaceInterrupts: PROCEDURE EXTERNAL; END;
+MsExitBackGround: PROCEDURE EXTERNAL; END;
+
+
+	/* The following signature should match the
+	*linkSignature defined in UserInterface1 */
+
+DCL Signature (*) BYTE PUBLIC INITIAL 
+$IF Phonelink
+							(14,'GRiDPhoneLink',0);
+$ELSE
+							(13,'GRiDGRiDLink',0);
+$ENDIF
+
+$IF Debugging
+DCL RamEntryPoint BYTE EXTERNAL;
+$ENDIF
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	PlmStart
+&
+&	MsReplaceInterrupts
+&	MsExitBackground
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PlmStart: PROCEDURE CLEAN;
+DCL (error, dummy) 	WORD;
+DCL dummyPTr		PTR;
+
+$IF Debugging
+$IF Phonelink
+DCL VersionMsg CharStr	(ClearScreenSeq, 
+					'MsDos Phonelink Version 85.08.20 resident',cr,lf,dollar);
+$ELSE
+DCL VersionMsg CharStr	(ClearScreenSeq, 
+					'MsDos GRiDLink Version 85.08.20 resident',cr,lf,dollar);
+$ENDIF
+	CALL MsLineOut (@VersionMsg);
+
+	DO;	 
+	DCL entryPointValue PTR;
+	DCL bo STRUCTURE (offset WORD, base WORD) AT (@EntryPointValue);
+	entryPointValue = @RamEntryPoint;
+	CALL MsLineOut (@('Data Segment Entry Point is at $'));
+	CALL ConHexOut (bo.base);
+	CALL MsCharOut (':');
+	CALL ConHexOut (bo.offset);
+	CALL NewLine;
+	entryPointValue = @EntryPoint;
+	CALL MsLineOut (@('Code Segment Entry Point is at $'));
+	CALL ConHexOut (bo.base);
+	CALL MsCharOut (':');
+	CALL ConHexOut (bo.offset);
+	CALL NewLine;
+	END;
+
+$ENDIF
+
+	CALL FigureOutSystem;
+	CALL MsReplaceInterrupts;
+	CALL MsExitBackground;
+
+END PlmStart;
+
+
+OsRegisterName: PROCEDURE (pName, token, mode, pError) CLEAN;
+	DCL pName	PTR;
+    DCL token 	DWORD;
+    DCL mode 	BYTE;
+	DCL pError	PTR;
+	DCL error 	BASED pError	WORD;
+	error = 0;
+END OsRegisterName;
+
+$IF NOT Debugging
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	FlushPrintQueue, Illegal Call
+&
+&	This routines are in DosFormatted I/O which is not linked in for
+&	non debug versions.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FlushPrintQueue: PROCEDURE CLEAN;
+	;
+END FlushPrintQueue;
+
+IllegalCall: PROCEDURE CLEAN;
+	;
+END IllegalCall;
+
+$ENDIF
+$ENDIF
+
+$EJECT
+$IF NOT MsDos
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	InterceptorTick:
+&
+&	This routine is called by Vipc2 for interceptors use.  FOr non-msdos
+&	versions provide a dummy routine;
+&	
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+InterceptorTick: PROCEDURE CLEAN;
+	;
+END InterceptorTick;
+
+$ENDIF
+
+$IF (NOT serverVFS) 
+$IF MsDOS OR (NOT Phonelink)
+
+DCL (Compass, Hornet, pc, pcAT) BOOLEAN PUBLIC INITIAL (TRUE, FALSE, FALSE, 
+		FALSE);
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	FigureOutSystem
+&
+&	This routine will figure out what System it is running on and set the
+&	global booleans: Hornet, pc & pcAT.
+&	
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF NOT MsDos
+CpScreenInfo: PROCEDURE (pBuf) EXTERNAL;
+  DCL pBuf      PTR;
+  END;
+$ENDIF
+
+DCL twoDashes  LIT '2d2dh';
+DCL pPartNumber POINTER INITIAL (0FDFD0h),
+	partNumber	BASED pPartNumber (1) WORD;
+
+FigureOutSystem: PROCEDURE REENTRANT;
+$IF MsDos
+	IF MsGetMachineType <> cpMachine THEN
+		DO;
+$ELSE
+DCL screenInfo ScreenInfoType;
+	CALL CpScreenInfo (@screenInfo);
+	IF SELECTOR$OF (screenInfo.pScreen) <> 40h THEN 
+		DO;
+$ENDIF
+		compass = FALSE;
+		IF partNumber(6) = twoDashes THEN Hornet = TRUE;
+		ELSE IF (FLAGS AND 8000h) <> 0 THEN pc = TRUE;
+		ELSE pcAT = TRUE;
+		END;
+END FigureOutSystem;
+$ENDIF
+$ENDIF
+
+END EntryPoint;		/* module */
+

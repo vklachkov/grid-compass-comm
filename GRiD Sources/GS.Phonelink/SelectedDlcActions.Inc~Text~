@@ -1,0 +1,4 @@
+AcFreeCB: PROCEDURE(sMachine, pDlCB) EXTERNAL;
+      DECLARE sMachine SELECTOR,
+              pDlCB SELECTOR;
+      END;

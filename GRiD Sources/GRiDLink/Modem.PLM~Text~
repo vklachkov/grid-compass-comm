@@ -1,0 +1,795 @@
+$TITLE ('Modem Device Driver Interface Routines')
+$COMPACT OPTIMIZE(3) SET(ModemInterface) PAGEWIDTH (95)
+
+ModemInterface: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	
+&	Edit History: 	Refer to GRiDLink&PHonelinkLog~DataBase~
+&
+&	AUthors:		Monty Boyer
+&					Rajendra Shah
+&
+&	This module implements all the calls to modem device driver under GRiD-OS.
+&	This module is different between GRiD-OS and MS-DOS Phonelink.  
+&
+&	The MAIN routines are:
+&
+&		ModemInitialize		: set up connections and data structures.
+&		ModemReset			: release connection, data structures.
+&
+&		ModemStart			: dial, establish data mode.
+&		ModemStop			: disconect modem
+&
+&		ModemAttach			: 
+&		ModemDetach			:
+&
+&		ModemDialPhone
+&
+&		ModemGetStatus		: check modem status & fifo
+&		ModemReadBuffer		: read bytes from modem driver
+&		ModemWriteBuffer	: write bytes to modem driver
+&
+&	The SUPPORT routines are (in alphabetical order):
+&
+&		EscHit
+&		ModemLockAcquire
+&		ModemLockRelease
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+
+$SAVE NOLIST
+
+	/* My favourite literals */
+
+$INCLUDE (``Incs`plm.inc~text~)
+
+	/* Os Constants & Externals */
+
+$SET (IncludeOsConstants)
+$INCLUDE (``incs`Errors.inc~text~)
+
+$INCLUDE (``OsIncs`Os.Device.Inc~Text~)
+$INCLUDE (``incs`OsPLMProcs.inc~text~)
+
+	/* Pdl Externals */
+
+$INCLUDE (Pdl.inc~text~)
+$INCLUDE (Dlc.Error.inc~text~)
+$INCLUDE (Pdl.Ext.inc~text~)
+$INCLUDE (PdlGlobals~text~)
+
+	/* for datalinkInfoType */
+
+$INCLUDE (VfsVipc.Type.Inc~Text~)	
+
+LoadOverlay: PROCEDURE (EnumeratedType, errorPtr) EXTERNAL;
+  DCL EnumeratedType WORD;
+  DCL ErrorPtr	   PTR;
+END; 
+
+FindThisTitle:PROCEDURE (PathNamePtr, errorPtr) Pointer EXTERNAL;
+  DCL PathNamePtr	PTR;
+  DCL ErrorPtr	   PTR;
+END;
+
+FreeString:PROCEDURE (StringPtrPtr) EXTERNAL;
+  DCL StringPtrPtr   PTR;				/* to a pointer */
+END;
+
+
+ConPeekChar: PROCEDURE BYTE EXTERNAL; END;
+ConKeyPressed: PROCEDURE BOOLEAN EXTERNAL; END;
+ConHexIn: PROCEDURE WORD EXTERNAL; END;
+
+PasInitMessage: PROCEDURE EXTERNAL; END;
+PasFreeMessage :PROCEDURE EXTERNAL; END;
+
+PasDisplayMessage: PROCEDURE (code) EXTERNAL;
+	DCL code WORD;
+	END;
+
+$IF Debugging
+
+DCL DebugMask WORD EXTERNAL;
+$INCLUDE (``GRiDLInk`Debug.Inc~Text~)
+
+$ELSE
+
+ConLineOUt: PROCEDURE (pBuffer, length) EXTERNAL;
+	DCL pBuffer	PTR;
+	DCL length	WORD;
+	END;
+
+ConCharIn: PROCEDURE BYTE EXTERNAL; END;
+
+$ENDIF
+$RESTORE
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				Constants
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL invisible 	LIT '2';
+DCL visible 	LIT '0';
+
+/*  modem driver mode byte values  */
+DCL setToDefault  	LIT '0',
+	configure		LIT '1',
+	setTimeouts   	LIT '2',
+	flushFIFO	 	LIT '3',
+	setFIFOPtr		LIT '4',
+	setVoice	  	LIT '5',
+	setData	   		LIT '6',
+	setLineSpeed  	LIT '7',
+	setOffHook		LIT '41',
+	setOnHook	 	LIT '42',
+	setConnMode   	LIT '43',
+	dial		  	LIT '44',
+	enableVoice   	LIT '45',
+	disableVoice  	LIT '46',
+	setVolume	 	LIT '50';
+
+DCL asyncProtocol	LIT	'1',
+
+	bits8			LIT '8',
+	stopBits1		LIT '1',
+	stopBits15		LIT '2',
+	stopBits2		LIT '3',
+	noParity		LIT '0';
+
+DCL disableModemInterrupts LIT '100',
+	enableModemInterrupts  LIT '101';
+
+/*  line speed values  */
+DCL LineSpeed300  	LIT '5',
+	LineSpeed1200 	LIT '7';
+
+/*  speaker volume values  */
+DCL zeroVolume		LIT '0',
+	mediumVolume  LIT '30H';
+
+DCL cancelKey			LIT '155',
+	escapeKey			LIT '1bh',
+	confirmKey			LIT '8Dh';
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Constants for Message Routines
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL dialing					LIT '0',
+	InVoiceMode				LIT '1',
+	WaitingForCarrier		LIT	'2',
+	DataMode				LIT '3',
+	disconnecting			LIT '4';
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	LOCAL VARIABLES
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL (modemAttached, IactivatedModem) BOOLEAN 
+		INITIAL (FALSE, FALSE);
+
+DCL ModemFifo 	(RxFifoSize)	BYTE;		/* modem drivers fifo buffer */
+
+DCL internalModemDeviceName 	(*) BYTE DATA (5,'modem');
+DCL externalModemDeviceName 	(*) BYTE DATA (6,'serial');
+DCL pModemDeviceName 			POINTER;
+
+DCL internalModemPathName 		(*) BYTE DATA (6,'`modem');
+DCL externalModemPathName 		(*) BYTE DATA (7,'`serial');
+
+DCL internalModemNameStr 		STRUCTURE (len WORD, max WORD, dummy BYTE,
+		chars (13) BYTE) DATA (13,13,13,'modem~Device~');
+DCL externalModemNameStr 		STRUCTURE (len WORD, max WORD, dummy BYTE,
+		chars (14) BYTE) DATA (14,14,14,'serial~Device~');
+
+DCL (pModemPathName, pModemNameStr) POINTER;
+
+DCL pModemFileNameStr   PTR,
+	modemFileNameStr	BASED pModemFileNameStr	STRUCTURE (
+						len		WORD,
+						max		WORD,
+						dummy	BYTE,
+						chars	(1) BYTE);
+
+DCL modem		   		WORD;
+DCL modemLock			WORD;		
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&			ALL Support Routines First
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+CallDriver: PROCEDURE (req, pPathName) WORD REENTRANT;
+DCL pl 			ParamListTYpe;
+DCL req			WORD;
+DCL error		WORD;
+DCL pPathName	PTR;
+
+	CALL SETB (0, @pl, SIZE (pl));
+	pl.pBuffer = pPathName;
+	CALL OsCallDriver (pModemPathName, 0, req, @pl, @error);
+ 	RETURN error;
+END CallDriver;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	EscHit: Check if cancel (code-esc) at the keyboard.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+EscHit: PROCEDURE BOOLEAN REENTRANT;
+DCL ch BYTE;
+
+	IF ConKeyPressed THEN
+		DO;
+		IF ConPeekChar = escapeKey THEN
+			DO;
+			ch = ConCharIn;   /* remove key from fifo */
+			RETURN (true);
+			END;
+		END;   
+	RETURN (false);
+END EscHit;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Acquire and Release Modem Lock
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemLockAcquire: PROCEDURE REENTRANT;
+DCL (note, error) WORD;
+	note = OsWait (modemlock, 0ffffh, @error);
+END ModemLockAcquire;
+
+
+ModemLockRelease: PROCEDURE REENTRANT;
+DCL error 	WORD;
+	CALL OsSignal (modemLock, signalNormal, 0, @error);
+END ModemLockRelease;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&		PUCLID ModemInterface routines
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemInitialize: Initialize the modem fifo
+&	all variables are initialized through initial stmts.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemInitialize: PROCEDURE WORD CLEAN;
+DCL error WORD;
+
+	modemLock = OsCreateSemaphore (@error);
+	IF error = 0 THEN CALL ModemLockRelease;
+	RETURN (error);
+END ModemInitialize;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemReset:	release the modem device driver.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemReset: PROCEDURE CLEAN;
+DCL error WORD;
+
+$IF Debugging
+	IF DlcEventsMaskSet THEN
+		DO;
+		DCL msg CHarStr ('Reset Modem',cr,lf);
+		CALL ConlineOut (@msg, size (msg));
+		END;
+$ENDIF
+
+	IF modemAttached THEN 
+	   	DO;
+		CALL OsDetach (modem, @error);
+		modemAttached = FALSE;
+		IF IactivatedModem THEN
+			DO;
+			error = CallDriver (DOUBLE (ddDeactivate), NULLPTR);
+			IF error = 0 THEN CALL OsRemoveDevice (pModemPathName, @error);
+			IactivatedModem = FALSE;
+$			IF Debugging
+			IF DlcEventsMaskSet THEN
+			IF error <> 0 THEN
+				DO;
+				DCL msg CHarStr 
+				('### Error in deactivate/Remove Device: ',cr,lf);
+				CALL HexOut (error);
+				CALL newline;
+				END;
+$ENDIF
+			END;
+		END;  /* deactivate it */
+
+	CALL OsDeleteSemaphore (modemLock, @error);
+END ModemReset;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&  	ModemStart: establish a modem connection
+&
+&	activate modem/serial driver
+&	ask ismain to attach to modem
+&	dial phone
+&	wait in voice if specified 
+&	enter data mode
+&	
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemStart: PROCEDURE (pDataLinkInfo) WORD CLEAN;
+
+	DCL pDataLinkInfo 	POINTER;
+	DCL	dataLinkInfo 	BASED pDataLinkInfo DataLinkInfoType;
+
+	DCL error 			WORD;
+	DCL notDone			BOOLEAN;
+
+	DCL timeOutCommand 	STRUCTURE
+					(mode 		BYTE,
+					character 	WORD,
+					connect 	WORD);
+
+	DCL command 		STRUCTURE
+					(mode 	BYTE,
+					value 	BYTE) 
+			AT (@timeOutCommand);
+
+	DCL (dummy, timeoutCount) WORD;
+	DCL ch 	BYTE;
+
+	DCL dataTimeOut LIT	'10';		/* 100 ms */
+
+$IF Debugging
+	IF DlcEventsMaskSet THEN
+		DO;
+		DCL msg CHarStr ('Start Modem',cr,lf);
+		CALL ConlineOut (@msg, size (msg));
+		END;
+$ENDIF
+
+	/* activate the modem device driver.  If modem driver is already activated
+	then eDevActive will be returned.  This is alright, on all other errors
+	return immediately. */
+
+	IF datalinkInfo.modemType = 1 THEN
+		DO;	/* Use system modem driver */
+		pModemDeviceName = @internalModemDeviceName;
+		pModemPathName = @internalModemPathName;
+		pModemNameStr = @internalModemNameStr;
+		END;
+	ELSE	/* use system serial driver */
+		DO;
+		pModemDeviceName = @externalModemDeviceName;
+		pModemPathName = @externalModemPathName;
+		pModemNameStr = @externalModemNameStr;
+		END;
+
+	IF not ModemAttached THEN
+		DO;
+		/* First find the path name of the modem driver to be used.  Find this
+		title is done here since it requires lot of stack and the forked process
+		has little stack */
+		CALL LoadOverlay (2, @error);
+		IF error = 0 THEN 
+			DO;
+			pModemFileNameStr = FindThisTitle (pModemNameStr, @error);
+			IF error = 0 THEN
+				DO;
+$				IF Debugging
+				IF DlcEventsMaskSet THEN
+					DO;
+					CALL ConLineOut (@modemFileNameStr.chars, 
+									modemFileNameStr.len);
+					CALL newline;
+					END;
+$				ENDIF
+				modemFileNameStr.dummy = modemFileNameStr.len;
+
+				/* Now signal the IsP to attach to the modem, and wait till it
+				signals back.  It is done so that the modem connection is done
+				on behalf of the data link process and not the application
+				process doing the sign-on.  In the later case the Os forces a
+				Detach to modem when the application quits. */
+
+				AttachModemNow = TRUE;  /* event for isp to start attach */
+				error = OsWait (attachComplete, 0ffffh, @error);
+				CALL FreeString (@pModemFileNameStr);
+				END;
+			END;
+		IF error <> 0 THEN RETURN (error);
+		END;
+
+	CALL PasInitMessage;
+	CALL PasDisplayMessage (dialing);
+
+	CALL ModemLockAcquire;
+
+	IF (error := ModemDialPhone (pDataLinkInfo)) = 0 THEN
+		DO;   
+		/* dialled successfully, now wait in voice mode if specified 
+		until confirmed to enter data mode */
+	
+		IF dataLinkInfo.waitInVoiceMode THEN
+			DO;
+			CALL OsSetStatus (modem, @(EnableVoice), 1, @error);
+			CALL OsSetStatus (modem, @(SetVoice), 1, @error);
+			IF error = 0 THEN
+				DO;
+				CALL PasDisplayMessage (InVoiceMode);
+				ch = ConCharIn;
+				DO WHILE (ch <> confirmKey) AND (ch <> escapeKey);
+					ch = ConCharIn;
+					END;
+				CALL OsSetStatus (modem, @(DisableVoice), 1, @error);
+				IF ch = escapeKey THEN error = eSignonRequestCancelled;
+				END;
+			END;
+
+		IF error = 0 THEN 
+			DO;
+			CALL PasDisplayMessage (waitingForCarrier);
+
+			/*  set timeouts for data mode handshake  */
+			timeOutCommand.mode = setTimeouts;
+			timeOutCommand.character = dataTimeOut;
+			timeOutCommand.connect = dataTimeOut;
+			CALL OsSetStatus (modem, @timeOutCommand.mode, 5, @error);
+
+			/* loop to attempt to complete data mode handshake. */
+			/* dataLinkInfo.connectTimeout is in 100th of a second, 
+			setTimer needs it in seconds */
+			
+			CALL SetTimer (dataLinkInfo.connectTimeOut/100);
+			notDone = true;
+		   	DO WHILE notDone;
+				CALL OsSetStatus (modem, @(setdata), 1, @error);
+				IF (error <> eModNotAnswer) AND (error <> eModTimeOut)
+				THEN notDone = false;
+				ELSE 
+					DO;
+					IF EscHit THEN 
+					   	DO;
+						notDone = FALSE;
+						error = eSignonRequestCancelled;
+						END;
+					ELSE IF TimerExpired THEN 
+					  	DO;
+						error = eModNotAnswer;
+						notDone = FALSE;
+						END;
+					END;
+				END;
+			CALL TurnTimerOff;
+
+			/*  flush the modem's fifo  */
+			CALL OsSetStatus (modem, @(flushFifo), 1, @dummy);
+			END;
+		END; 
+
+	/* turn off speaker then delay before 
+	return to allow GC to get ready */
+
+	command.mode = setVolume;
+	command.Value = zeroVolume;
+	CALL OsSetStatus (modem, @command.mode, 2, @dummy);
+
+	CALL ModemLockRelease;
+
+	IF error = 0 THEN 
+	 	DO;
+		CALL PasDisplayMessage (dataMode);
+		CALL OsDelay (500);  /* 500 ms I dont remember why we need this */
+		END;
+	ELSE 
+		DO;
+		CALL PasDisplayMessage (disconnecting);
+		CALL ModemStop;
+		END;
+
+	CALL PasFreeMessage;
+	RETURN (error);
+END ModemStart;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemStop: terminate the modem connection (hangup)
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemStop: PROCEDURE CLEAN;
+DCL fifoCommand STRUCTURE
+					(mode BYTE,
+					pFifo PTR);
+DCL error WORD;
+
+	CALL ModemLockAcquire;
+$IF Debugging
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN
+		DO;
+		DCL msg CHarStr ('Stop Modem',cr,lf);
+		CALL ConlineOut (@msg, size (msg));
+		END;
+$ENDIF
+
+	CALL OsSetStatus (modem, @(setOnHook), 1, @error);
+	CALL ModemLockRelease;
+END ModemStop;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemAttach - Really do the initialization
+&
+& 	Activate the modem driver. 
+&	Attach the modem device driver.  
+&	Then set its receive buffer.  
+&	This routine is called from the IsEmulator process.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemAttach: PROCEDURE WORD CLEAN;
+DCL Error 		WORD;
+DCL dummy 		WORD;
+$IF Debugging
+DCL setRcvChRtncommand STRUCTURE (
+						mode 		BYTE,
+						pRcvChRtn	POINTER);
+$ENDIF
+
+DCL fifoCommand STRUCTURE (
+						mode 		BYTE,
+						pFifo 		PTR,
+						fifoLength	WORD);
+
+$IF Debugging
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN
+		DO;
+		DCL msg CHarStr ('Attach Modem',cr,lf);
+		CALL ConlineOut (@msg, size (msg));
+		END;
+$ENDIF
+
+	CALL OsAddDevice (@modemFileNameStr.dummy, pModemDeviceName, NULLPTR, 
+						0, false, invisible, @error);
+$	IF debugging
+	IF error <> 0 THEN
+		DO;
+		DCL msg CharStr ('#### Activate error: ');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (error);
+		CALL NewLine;
+		END;
+$	ENDIF
+
+	IF error = 0 THEN
+		DO;
+		IactivatedModem = TRUE;
+		error = CallDriver (DOUBLE (ddInitialize), @modemFileNameStr.dummy);
+$		IF debugging
+		IF error <> 0 THEN
+			DO;
+			DCL msg CharStr ('#### ddInitialize error: ');
+			CALL ConLineOut (@msg, size(msg));
+			CALL HexOut (error);
+			CALL NewLine;
+			END;
+$		ENDIF
+		END;
+	ELSE IF error = eDevActive THEN error = 0;
+
+	IF error <> 0 THEN RETURN (error);
+
+	modem = OsAttach (pModemPathName, 2, @(0), 3, @error);
+	IF error <> 0 THEN RETURN (error);
+
+$IF Debugging
+	IF intDrivenMaskSet THEN
+		DO;
+		setRcvChRtnCommand.mode = 200;
+		setRcvChRtnCommand.pRcvChRtn = @RcvChRtn;
+		CALL OsSetStatus (modem, @setRcvChRtnCommand, 
+						size(setRcvChRtnCommand), 
+						@error);
+		IF error <> 0 THEN RETURN (error);
+		END;
+	ELSE
+$ENDIF
+		DO;
+		/* allocate fifo for modem driver */
+		fifoCommand.mode = setFifoPtr;
+		fifoCommand.fifoLength = RxFifoSize;
+		fifoCommand.pFifo = @ModemFifo;
+		CALL OsSetStatus (modem, @fifoCommand.mode, size(fifoCommand), @dummy);
+		END;
+
+	modemAttached = TRUE;
+	RETURN (0); 
+END ModemAttach;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemDialPhone - dial the specified phone number
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemDialPhone: PROCEDURE (pDataLinkInfo) WORD REENTRANT;
+
+	DCL pDataLinkInfo		PTR,
+		dataLinkInfo 		BASED pDataLinkInfo DataLinkInfoType;
+	DCL dataLinkInfoArray	BASED pDataLinkInfo (1) BYTE;
+
+	DCL	error 			WORD;
+
+	DCL saveTimeout 	BYTE;
+
+	DCL pDialCommand 	PTR;
+	DCL dialCommand 	BASED pDialCommand 
+			STRUCTURE
+				(mode 		BYTE,
+				touchTone	BOOLEAN,
+				length 		BYTE,
+				buffer (1) 	BYTE);
+
+	DCL command STRUCTURE
+				(mode 		BYTE,
+				value 		BYTE,
+				value2		WORD);
+
+	DCL ConfigureCommand STRUCTURE
+				(mode		BYTE,
+				protocol	BYTE,
+				BitsPerChar	BYTE,
+				StopBits	BYTE,
+				Parity		BYTE);					
+
+	DCL cmdLength		BYTE;
+	DCL offset			WORD;
+
+	/* Configure driver */
+	ConfigureCommand.mode = configure;
+	ConfigureCommand.protocol = asyncProtocol;
+	ConfigureCommand.bitsPerChar = 8;
+	ConfigureCommand.StopBits = stopbits1;
+	ConfigureCommand.parity = noparity;
+	CALL OsSetStatus (modem, @configureCommand.mode, size (configureCommand),
+										 @error);
+
+	/*  set ptr to dial command parms in dataLinkInfo */
+	pDialCommand = @dataLinkInfo.activityTimeout;
+
+	/*  set speaker volume  */
+	command.mode = setVolume;
+	command.Value = dataLinkInfo.speakerVolume;
+	CALL OsSetStatus (modem, @command.mode, 2, @error);
+
+	/*  set the line speed  */
+	cmdLength = 2;
+	command.mode = setLineSpeed;
+	command.Value = dataLinkInfo.baudRate;
+	IF command.Value = 0F0h THEN
+		DO;
+		command.Value = 0FEh;
+		/* The counter value is word field right after the phone number
+		in the dataLinkInfo structure */
+		offset = SIZE(dataLinkInfo) - 1 + dataLinkInfo.phoneNumberLen;
+		CALL MOVW (@dataLinkInfoArray (offset), @command.value2, 1);
+		cmdLength = 4;
+$IF Debugging
+		/* IF DlcEventsMaskSet THEN */
+			DO;
+			DCL msg CharStr ('Counter Value for editable Baud Rate =');
+			CALL ConLineOut (@msg, size (msg));
+			CALL HexOut (command.value2);
+			CALL newline;
+			END;
+$ENDIF
+		END;
+	CALL OsSetStatus (modem, @command.mode, cmdLength, @error);
+
+	/* If baud rate is 300 or 1200 then set appropriate interframeGap.
+	GRiD central requires a 100 ms delay between frames.  
+	300 & 1200 are the only GC supported baud rates */
+
+	IF (command.value = 5) OR (command.value = 7) 
+	   THEN interFrameGap = GRiDCentralInterFrameGap;
+
+	IF error = 0 THEN
+		DO;
+		/*  dial the phone  */
+		saveTimeout = dataLinkInfo.activityTimeout;
+		dialCommand.mode = dial; /* this field overlaps with
+								 datalinkinfo.activitytimeout */
+		CALL OsSetStatus (modem, @dialCommand.mode, 
+	 			(dialCommand.length + 3), @error);
+		dataLinkInfo.activityTimeout = saveTimeout;
+		END;
+
+	RETURN (error);
+
+END ModemDialPhone;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemGetStatus:
+&
+&		Return Appropriate error cod if Com link
+&		is in bad shape.  If no erro return number
+&		of bytes in fifo.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemGetStatus: PROCEDURE (pBytesInFifo) WORD CLEAN;
+
+DCL error 			WORD;
+DCL pBytesInFifo	POINTER,
+	bytesInfifo		BASED pBytesInFifo WORD;
+
+DCL modemStatus STRUCTURE
+		(OsStuff (7) BYTE,
+		byteCount WORD,
+		syncDetect BOOLEAN,
+		status BYTE);
+
+DCL modemStatusLength 	LIT '11',
+	lossOfCarrier 		LIT '4';
+
+
+	CALL ModemLockAcquire;
+
+	bytesInFIFO = 0;
+	CALL OsGetStatus (modem, @modemStatus, modemStatusLength, @error);
+	IF error = 0 THEN 
+		IF modemStatus.status = lossOfCarrier THEN error = eModLossCarrier;
+		ELSE bytesInFifo = modemStatus.byteCount;
+
+	CALL ModemLockRelease;
+	RETURN error;
+END ModemGetStatus;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemReadBuffer:
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemReadBuffer: PROCEDURE (pBuffer, length, pError) WORD CLEAN;
+DCL pBuffer		PTR;
+DCL pError		PTR,
+	error		BASED	pError WORD;
+DCL length		WORD;
+DCL bytesRcvd	WORD;
+
+	CALL ModemLockAcquire;
+	bytesRcvd = OsRead (modem, pBuffer, length, pError);
+	CALL ModemLockRelease;
+	RETURN (bytesRcvd);
+END ModemReadBuffer;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ModemWriteBuffer:
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ModemWriteBuffer: PROCEDURE (pBuffer, length) WORD CLEAN;
+DCL pBuffer		PTR;
+DCL length		WORD;
+DCL error 		WORD;
+
+	CALL ModemLockAcquire;
+	CALL OsWrite (modem, pBuffer, length, @error);
+	CALL ModemLockRelease;
+	RETURN error;
+END ModemWriteBuffer;
+
+
+END ModemInterface; 

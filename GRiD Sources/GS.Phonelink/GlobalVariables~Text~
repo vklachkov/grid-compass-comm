@@ -1,0 +1,30 @@
+DCL PorE LIT 
+
+$IF MainModule
+	'PUBLIC';
+$ELSE
+	'EXTERNAL';
+$ENDIF
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*					Global Variables
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL sDummy SELECTOR PorE;
+
+DCL maxPhoneLines		LIT	'4',
+
+	stateMachines (MaxPhoneLines) SELECTOR PorE;
+
+	/* contains state information control blocks for 4 active machines */
+
+	DCL pdlMachineInitValues pdlStateMachineType PorE
+$								IF MainModule
+								INITIAL (pdlMachineInitConstants) 
+$ 								ENDIF			                    
+;
+
+DCL connectionID				BYTE PorE;
+DCL activityTimerCount			WORD PorE;
+
+DCL globalDebug					WORD EXTERNAL;

@@ -1,0 +1,189 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*				State Transition Tables:
+*
+*	The transition tables for each state is an array of 3-tuples.
+*	Each 3-tuple contains the following:
+*
+*			Event						BYTE
+*			NextState					BYTE
+*			Address of Action Procedure WORD
+*
+*	The table is terminated by a sentinel value of 0.
+*
+**&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+DCL TransitionTblEntry LIT 'STRUCTURE (
+					event				BYTE,
+					nextState			BYTE,
+					actionProcedure		WORD)';
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*		Transition Table for state = PdlSxClosed
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE PdlSxClosedTable (17) TransitionTblEntry DATA (
+
+/* event					nextState			Action */
+
+PdlExDlcConnRequest,		PdlSxListening,		.PdlAcConnect,
+PdlExDlcSendRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExDlcFlushRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExDlcDiscRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExRcvRecError,			nsc,				.PdlAcFreeCB,
+PdlExRcvIrError,			nsc,				.PdlAcFreeCB,
+PdlExXmitComplete,			nsc,				.PdlAcFreeCB,
+PdlExRcvdDcdOn,				nsc,				.PdlAcFreeCB,
+PdlExUserTimeout,			nsc,				.PdlAcFreeCB,
+PdlExResponseTimeOut,		nsc,				.PdlAcFreeCB,
+PdlExPollTimeOut,			nsc,				.PdlAcFreeCB,
+PdlExRcvdRfc,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdPing,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdData,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdAck,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdDisc,				nsc,				.PdlAcQueueReceive,
+0);
+
+
+
+
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*		Transition Table for state = PdlSxConnecting
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE PdlSxConnectingTable (17) TransitionTblEntry DATA (
+
+/* event					nextState			Action */
+
+PdlExRcvdDcdOn,				PdlSxListening,		.PdlAcProcessDcd,
+PdlExDlcConnRequest,		nsc,				.PdlAcConnect,
+PdlExUserTimeout,			PdlSxClosed,		.PdlAcUserTimeout,
+PdlExResponseTimeOut,		nsc,				.PdlAcFreeCB,
+PdlExPollTimeOut,			nsc,				.PdlAcFreeCB,
+PdlExXmitComplete,			nsc,				.PdlAcFreeCB,
+PdlExRcvRecError,			nsc,				.PdlAcFreeCB,
+PdlExRcvIrError,			nsc,				.PdlAcHangupAndListen,
+PdlExDlcSendRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExDlcFlushRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExDlcDiscRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExRcvdRfc,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdPing,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdData,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdAck,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdDisc,				nsc,				.PdlAcQueueReceive,
+0);
+
+
+
+
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*		Transition Table for state = PdlSxConnected
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE PdlSxConnectedTable (17) TransitionTblEntry DATA (
+
+/* event					nextState			Action */
+
+PdlExRcvRecError,			nsc,				.PdlAcSendAck,
+PdlExRcvdRfc,				nsc,				.PdlAcSendRfcRespIfNotActive,
+PdlExRcvdPing,				nsc,				.PdlAcProcessPing,
+PdlExRcvdData,				nsc,				.PdlAcProcessReceivedInfo,
+PdlExRcvdAck,				nsc,				.PdlAcProcessAck,
+PdlExRcvdDisc,				PdlSxDisconnecting,	.PdlAcProcessRemDisc,
+PdlExRcvIrError,			PdlSxDisconnecting,	.PdlAcProcessRcvIrError,
+PdlExDlcFlushRequest,		PdlSxDisconnecting,	.PdlAcProcessLocalFlush,
+PdlExDlcDiscRequest,		PdlSxDisconnecting,	.PdlAcProcessLocalFlush,
+PdlExDlcSendRequest,		nsc,				.PdlAcQueueSend,
+PdlExDlcConnRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExXmitComplete,			nsc,				.PdlAcChkXmitComplete,
+PdlExResponseTimeOut,		nsc,				.PdlAcResponseTimeout,
+PdlExPollTimeOut,			nsc,				.PdlAcChkActivityTimeOut,
+PdlExUserTimeout,			nsc,				.PdlAcFreeCB,
+PdlExRcvdDcdOn,				nsc,				.PdlAcFreeCB,
+0);
+
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*		Transition Table for state = PdlSxDisconnecting
+*
+*	Note that the table below does not show any state changes, The routine
+*	CompletDisc forcibly changes the state.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE PdlSxDisconnectingTable (17) TransitionTblEntry DATA (
+
+/* event					nextState			Action */
+
+PdlExDlcFlushRequest,		nsc,				.PdlAcCompleteFlush,
+PdlExXmitComplete,			nsc,				.PdlAcChkXmitComplete,
+PdlExDlcDiscRequest,		nsc,				.PdlAcCompleteDisc,
+PdlExDlcSendRequest,		nsc,				.PdlAcQueueSendIfFlushing,
+PdlExDlcConnRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExRcvRecError,			nsc,				.PdlAcFreeCB,
+PdlExRcvIrError,			nsc,				.PdlAcFreeCB,
+PdlExRcvdDcdOn,				nsc,				.PdlAcFreeCB,
+PdlExUserTimeout,			nsc,				.PdlAcFreeCB,
+PdlExResponseTimeOut,		nsc,				.PdlAcFreeCB,
+PdlExPollTimeOut,			nsc,				.PdlAcFreeCB,
+PdlExRcvdDisc,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdRfc,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdPing,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdData,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdAck,				nsc,				.PdlAcQueueReceive,
+0);
+
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*		Transition Table for state = PdlSxListening
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE PdlSxListeningTable (17) TransitionTblEntry DATA (
+
+/* event					nextState			Action */
+
+PdlExRcvdRfc,				PdlSxConnected,		.PdlAcReportConnected,
+PdlExDlcConnRequest,		nsc,				.PdlAcConnect,
+PdlExResponseTimeout,		nsc,				.PdlAcRfcTimeout,
+PdlExRcvIrError,			nsc,				.PdlAcHangupAndListen,
+PdlExDlcSendRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExDlcFlushRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExDlcDiscRequest,		nsc,				.PdlAcReportBadRequest,
+PdlExRcvdDcdOn,				nsc,				.PdlAcStartRfcTimeout,
+PdlExXmitComplete,			nsc,				.PdlAcFreeCB,
+PdlExRcvRecError,			nsc,				.PdlAcFreeCB,
+PdlExUserTimeout,			nsc,				.PdlAcHangupAndListen,
+PdlExPollTimeOut,			nsc,				.PdlAcFreeCB,
+PdlExRcvdAck,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdDisc,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdPing,				nsc,				.PdlAcQueueReceive,
+PdlExRcvdData,				nsc,				.PdlAcQueueReceive,
+0);
+
+
+
+
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*		Table Of Pointers to Transition Table
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL TransitionTablePTrs (*) POINTER DATA (
+
+/* PdlSxCLosed			*/		@PdlSxClosedTable,
+/* PdlSxConnecting		*/		@PdlSxConnectingTable,
+/* PDlSxConnected		*/		@PdlSxConnectedTable,
+/* PdlSxDisconencting	*/		@PdlSxDisconnectingTable,
+/* PDlSxListening		*/		@PdlSxListeningTable);

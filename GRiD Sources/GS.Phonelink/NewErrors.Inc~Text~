@@ -1,0 +1,19 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	MyErrors.Inc:
+*
+*	Should include in DlcMsgDefines.Inc
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE
+
+	eOK						LIT '0',
+	eDlcActivityTimeOut		LIT	'702',
+	eDlcRetriesExhausted 	LIT '704',
+	eDlcRfcCrossover		LIT	'710',
+	eDlcAlreadyConfigured	LIT	'740',
+	eDlcAckWithoutSend		LIT	'741',
+	eDlcInvalidConnection	LIT '742',
+ 	eDlcRcvdInvalidAck		LIT '743',
+	eDlcLocalClosed			LIT	'745',
+	eDlcLinkNotConfigured	LIT '746';
+

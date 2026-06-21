@@ -1,0 +1,902 @@
+$TITLE ('Interrupt service emulation process')
+$COMPACT
+$OPTIMIZE(3) SET(ISEMULATOR) SET(dataLink)
+
+IsEmulator: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	IsEmulator
+&	Function :	Interrupt service emulation process for the Phone data link
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$EJECT
+$save NOLIST
+$INCLUDE (``incs`PLM.inc~text~)
+$SET (IncludeOsConstants)
+$INCLUDE (``incs`Errors.plm.inc~text~)
+$INCLUDE (``incs`OsPLMProcs.inc~text~)
+
+$INCLUDE (``GRiDLink`VfsVipc.Constant.inc~text~)
+$INCLUDE (``GRiDLink`Vipc.Ext.inc~text~)
+
+$INCLUDE (Dlc.Error.Inc~Text~)
+$INCLUDE (Pdl.inc~text~)
+$INCLUDE (Pdl.Ext.inc~text~)
+$INCLUDE (PdlGlobals~text~)
+$RESTORE
+
+$IF Debugging
+DCL DebugMask WORD EXTERNAL;
+$INCLUDE (``GRiDLInk`Debug.Inc~Text~)
+$ENDIF
+
+$EJECT
+DCL PdlWindowSize 	LIT '1',	/* one outstanding frame */
+	EomFlagOn		LIT '01h',  /* set the End of message flag */
+	seqNumModulo	LIT '256';  /* sequence #s are modulo 256 */
+
+/* Protocol TimeOuts in seconds */
+
+$IF normalPhonelink
+DCL RfcTimeOut		LIT	'1';	/* Wait 1 sec for Rfc resp before retrying*/
+DCL idlePingTimeOut	LIT	'10';	/* when no data activity is going on pings
+								are sent every 10 seconds */
+DCL ackTimeOut		LIT	'1';	/* Wait 1 sec after sending a data frame for 
+								an ACK for the first time.*/
+DCL pingForAckTimeout	
+					LIT	'3';	/* wait 3 sec between pings for ack */
+$ELSE
+DCL RfcTimeOut		LIT	'5';	/* Wait 5 sec for Rfc resp before retrying*/
+DCL idlePingTimeOut	LIT	'10';	/* when no data activity is going on pings
+								are sent every 10 seconds */
+DCL ackTimeOut		LIT	'5';	/* Wait 5 sec after sending a data frame for 
+								an ACK for the first time.*/
+DCL pingForAckTimeout	
+					LIT	'5';	/* wait 5 sec between pings for ack */
+$ENDIF
+
+/* module global variables */
+
+/* portion of Rfc frame in user data area */
+DCL RfcData STRUCTURE
+	(pdlConn BYTE,
+	 pdlVersion (2) BYTE) INITIAL(0,'02');  
+DCL RfcFiller LIT '0AAh';	/* bit pattern used by GC to detect line speed */
+
+
+/* Define Transmit Buffer variables */
+
+DCL CurTxBufDesc TxBufDescType AT (@TxBufferDesc);
+
+DCL TxShortFrame TxBufDescType; /* short buffer for sending a control frame */
+
+/* Error control variables */
+DCL (pingRetries,			/* # of resends of ping after user data */
+	rfcRetries,				/* # of resends of rfc */
+	dataRetries,			/* # of resends of data itself */
+	IdleTime)	WORD;		/* counter for seconds of no data xfr */
+
+/* Upper limits on retries */
+DCL MaxPingRetries	LIT	'16',	/* 16 attemts to send pings after data frame */
+	MaxRfcRetries	LIT	'8',	/* 8 attemps for rfc without response */
+	MaxDataRetries	LIT	'16',	/* 16 attemps for data itself on nacks */
+	MaxIdlePingRetries
+					LIT '6';	/* 6 attempts for response to idle pings */
+								/* approximately 1 minute				 */
+
+DCL (SendOutstanding, pingOutstanding) BOOLEAN INITIAL (false, false);
+
+DCL (nackReceived, pingOrDataReceived) BOOLEAN INITIAL (FALSE);
+
+DCL idlePingRetries		BYTE INITIAL (0);
+
+DCL OkToRcvRfc	BOOLEAN;
+
+DCL ReferenceTime DWORD;
+
+DCL reasonForDlcDeath WORD PUBLIC INITIAL (eDlcNotRunning);
+
+DCL signalMode		WORD INITIAL (signalNormal);
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Misc Utility Routines:
+&
+&	ResetTimer - sets reference time to current time.
+&	TimerExpired - return true if timerValue seconds have 
+&					elapsed since referenceTime.
+&	SetTimer - sets 'timerValue' and reset reference time;
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL timerValue WORD INITIAL (0ffh);
+DCL timerActive	BOOLEAN INITIAL (false);
+
+
+TurnTimerOff: PROCEDURE CLEAN;
+timerActive = FALSE;
+END TurnTimerOff;
+
+
+ResetTimer: PROCEDURE CLEAN;
+	ReferenceTime = promVariables.sysCounter;
+END ResetTimer;
+
+
+TimerExpired: PROCEDURE BOOLEAN CLEAN;
+DCL timeElapsed DWORD;
+	/* The timer value is set in seconds.  syscounters is in mili seconds.  
+	Instead of dividing by 1000, we divide by 1024 by shifting 10 times, 
+	thus saving divide code and an illegal fixup */
+
+	IF timerActive THEN 
+		DO;
+		timeElapsed = promVariables.sysCounter - referenceTime;
+		timeElapsed = SHR (timeElapsed, 10);
+		IF (timeElapsed > timerValue) THEN RETURN (TRUE);
+		END;
+	RETURN (false);
+END TImerExpired;
+
+
+SetTimer: PROCEDURE (n) CLEAN;
+/* n is timer value in seconds */
+DCL n WORD;
+	timerValue = n;
+ 	CALL ResetTimer;
+	timerActive = TRUE;
+END SetTimer;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	SendRfc - Send a request for connection frame
+&
+&	If we are the client then send Rfc with a set pattern to allow GC to 
+&	detect the line speed.  If we are the server then send Rfc with 
+&	windowSize, seqNumber & PdlConn set to initial values for connection.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+SendRfc: PROCEDURE REENTRANT;
+DCL error WORD;
+ 
+	TxShortFrame.flags = RfcFiller;
+	TxShortFrame.windowSize = RfcFiller;
+	TxShortFrame.seqNumber = RfcFiller;
+	RfcData.pdlConn = RfcFiller;
+    TxShortFrame.frametype = RfcType;
+  	TxShortFrame.length1 = 3;
+  	TxShortFrame.pPart1 = @RfcData.pdlConn;
+  	TxShortFrame.length2 = 0;
+  	error = PdlSendFrame (@TxShortFrame);
+	CALL SetTimer (rfcTimeOut);	
+				/* Retry every 1/2 second. Need to retry this often 
+				because GRiD Central is rather impatient and drops 
+				the phone line if rfc is not seen soon. */
+
+$IF Debugging 
+	IF DlcIOTraceMaskSet THEN
+		DO;
+		DCL msg CharStr (cr,'sent RFC ');
+		CALL ConLineOUt (@msg, size (msg));
+		CALL HexByteOut (TxShortFrame.frameType);
+		CALL HexByteOut (TxShortFrame.flags);
+		CALL HexByteOut (TxShortFrame.windowSize);
+		CALL HexByteOut (TxShortFrame.seqNumber);
+		CALL HexByteOut (RfcData.PdlConn);
+		CALL HexByteOut (RfcData.PdlVersion(0));
+		CALL HexByteOut (RfcData.PdlVersion(1));
+		CALL newline;
+		END;
+$ENDIF
+
+END SendRfc;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	SendShortFrame - Send a pdl control frame
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+SendShortFrame: PROCEDURE (fType) REENTRANT;
+
+DCL fType BYTE,  /* frame type */
+	pdlConn  BYTE;
+DCL error WORD;
+		
+	TxShortFrame.frametype = fType;
+	TxShortFrame.flags = EomFlagOn;
+
+	/* flags and window Size fields are not used, so use letter so that
+	they can easily identified on the Data line monitor.
+	zzz GRiD Central may not like it however */
+
+	IF ftype = ACKType THEN TxShortFrame.windowSize = 'A';
+	ELSE IF ftype = PingType THEN TxShortFrame.windowSize = 'P';
+	ELSE IF ftype = DiscType THEN TxShortFrame.windowSize = 'S';
+
+	TxShortFrame.seqNumber = RecvSequence;
+	pdlConn = ConnectionID;
+	TxShortFrame.length1 = 1;
+	TxShortFrame.pPart1 = @pdlConn;
+	TxShortFrame.length2 = 0;
+	error = PdlSendFrame (@TxShortFrame);
+
+$IF Debugging
+	IF DlcIOTraceMaskSet THEN
+		DO;
+		DCL msg2 CharStr ('sent ACK '),
+			msg3 CharStr ('sent DISC'),
+			msg4 CharStr ('sent PING');
+		DO CASE ftype-2;
+			/* ftype = 2 : Acknowledgement  */	
+				CALL ConLIneOUt (@msg2, size(msg2));
+			/* ftype = 3 : Disconnect		 */	
+				CALL ConLIneOUt (@msg3, size(msg3));
+			/* ftype = 4 : Request for Ack  */	
+				CALL ConLIneOUt (@msg4, size(msg4));
+			END;
+
+		CALL HexByteOut (TxShortFrame.frameType);
+		CALL HexByteOut (TxShortFrame.flags);
+		CALL HexByteOut (TxShortFrame.windowSize);
+		CALL HexByteOut (TxShortFrame.seqNumber);
+		CALL HexByteOut (PdlConn);
+		CALL newline;
+		END;
+$ENDIF
+
+END SendShortFrame;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+SendDataFrame
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+SendDataFrame: PROCEDURE REENTRANT;
+DCL error WORD;
+ 
+	CALL TurnTimerOff;		/* Disable the timer while the data frame 
+							is being transmitted which may take as much 
+							as 20 seconds at 300 baud */
+								
+	error = PdlSendFrame (@curTxBufDesc);  /* send user data */
+	pingRetries = 0;
+	idleTime =0;
+	CALL SetTimer (ackTimeOut);
+
+$IF Debugging 
+	IF DlcIOTraceMaskSet THEN
+		DO;
+			DCL msg1 CharStr ('sent DATA');
+			DCL msg2 CharStr (' data length =');
+
+		CALL ConLIneOUt (@msg1, size (msg1));
+		CALL HexByteOut (curTxBufDesc.frameType);
+		CALL HexByteOut (curTxBufDesc.flags);
+		CALL HexByteOut (curTxBufDesc.windowSize);
+		CALL HexByteOut (curTxBufDesc.seqNumber);
+
+		CALL ConLIneOUt (@msg2, size (msg2));
+		CALL HexOut (curTxBufDesc.length1+curTxBufDesc.length1);
+		CALL newline;
+		END;
+$ENDIF
+END SendDataFrame;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	StartDataFrame
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+StartDataFrame: PROCEDURE CLEAN;
+
+	/* Start Data Frame is called by DlcInterface straight, hence set the 
+	timer value so high that it will not expire while we are doing this */
+
+	CALL TurnTimerOff;
+
+	curTxBufDesc.frametype = dataType;
+	curTxBufDesc.flags = EomFlagOn;
+
+	/* zzz GRD Central may not like this */
+	curTxBufDesc.windowSize = 'D';
+
+	curTxBufDesc.seqNumber = SendSequence;
+	SendSequence = (SendSequence + 1) MOD seqNumModulo;
+	dataRetries = 0;
+
+	/* Note that we are setting sendOutstanding to true before really sending 
+	the frame, because what happens otherwise is that, the ack comes back even
+	before the sendDataFrame routine returns from all its levels,  and that
+	ack is thrown away as an invalid ACK */
+
+	sendOutStanding = TRUE;
+	CALL SendDataFrame; /* send user data */
+END StartDataFrame;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	StartRfc - Start Connecting.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+StartRfc: PROCEDURE CLEAN;
+	rfcRetries, idleTime = 0;
+	nackReceived, pingOrDataReceived, sendOutstanding, pingOutstanding = FALSE;
+	currentState = SxConnecting;
+	CALL SendRfc;
+$IF Debugging
+	IF intDrivenMaskSet THEN signalMode = signalNormal OR 80h;
+$ENDIF
+END StartRfc;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Interrupt Service Routine Emulator Process.
+&	This is a pseudo process, since it is called every
+&	once in a while (at least every 100ms) by DlcProces
+&	which is called by VipcProcess.  This is done so that
+&	we could implement vipcProcess and IsMain process using
+&	only one process structure 
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+IsMain: PROCEDURE WORD CLEAN;
+DCL event 					BYTE;
+DCL (error, dummy) 			WORD;
+DCL maxDelayBeforeNextPoll	WORD;
+
+	maxDelayBeforeNextPoll = 100;	/* 100 ms unless changed by CheckReceiver */
+
+	IF currentState = SxDisconnected THEN
+		DO;
+		IF AttachModemNow THEN	/* check for attach modem request */
+			DO;
+			AttachModemNow = false;
+			error = ModemAttach;
+			CALL OsSignal (attachComplete, signalNormal, error, @dummy);
+			DlcProcessID = OsWhoAmI;
+			END;
+		RETURN (maxDelayBeforeNextPoll);
+		END;
+
+	IF currentState = SxDisconnecting THEN
+		DO;
+		CALL DisconnectDlc (reasonForDlcDeath);
+		RETURN (maxDelayBeforeNextPoll);
+		END;
+
+	maxDelayBeforeNextPoll = CheckReceiveStatus (@error); 
+	IF error <> 0 THEN 
+		DO;
+		CALL StartDisconnect (eDlcLostPhysicalConn);
+		RETURN (maxDelayBeforeNextPoll);
+		END;
+	
+	IF pingOrDataReceived THEN 
+		DO;
+		pingOrDataReceived = FALSE;
+		CALL SendShortFrame (ackType);
+		END;
+
+	IF nackReceived THEN 
+		DO;
+		nackReceived = FALSE;
+		CALL RetryData;
+		END;
+
+	IF timerExpired THEN 
+		DO;
+		CALL TurnTimerOff;		/* turn it off until someone sets it */
+		IF currentState = SxConnecting THEN
+			DO;
+			IF (rfcRetries := rfcRetries + 1) <= MaxRfcRetries THEN 
+				DO;
+$IF Debugging
+				IF DlcErrorsMaskSet THEN 
+					DO;
+					DCL msg CharStr ('Sending Rfc #');
+					CALL ConLineOUt (@msg, size(msg));
+					CALL DecimalOut (rfcRetries);
+					CALL newline;
+					END;
+$ENDIF
+				CALL SendRfc;
+				END;
+			ELSE CALL StartDisconnect (eDlcTooManyRetries);
+			END;
+
+		IF currentState = SxConnected THEN
+			DO;
+			IF sendOutstanding THEN CALL PingForAck;
+			ELSE 
+				DO;
+				idleTime = idleTime + 10;
+				IF (idleTime >= ActivityTimeOutValue) 
+					AND (ActivityTimeOutValue <> 0ffffh) THEN
+					DO;
+					idleTime = 0;
+				  	CALL VipcProcessDataLinkEvent (Dlc_Ex_ActivityTimeout, 
+													0, eOk);
+					RETURN (maxDelayBeforeNextPoll);
+					END;
+
+				IF pingOutstanding 
+					THEN idlePingRetries = idlePingRetries + 1;
+					ELSE idlePingRetries = 0;
+				IF idlePingRetries >= maxIdlePingRetries
+					THEN CALL StartDisconnect (eDlcServerNotResponding);
+				ELSE 
+					DO;
+					pingOutStanding = TRUE;
+					CALL SendShortFrame (pingType);
+					CALL SetTimer (idlePingTimeout);
+					END;
+				END;
+			END;
+
+		/* do nothing in other states */
+		END;
+
+	RETURN (maxDelayBeforeNextPoll);
+END IsMain;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ProcessErrorInReceive: error detected in receiving frame, report it 
+&	to Vipc for displaying a message.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ProcessErrorInReceive: PROCEDURE (error, usingShortRxBuffer) CLEAN;
+DCL error				WORD;
+DCL usingShortRxBuffer	BOOLEAN;
+
+	IF currentState = SxConnected THEN
+		DO;
+    	/* Send an ACK if using large rcv buffer.  If we send an ACK 
+		while receiving in small buffer, there is a possibility of
+		infinite loop in the following situation:  The Large Rx BUffer
+		is tied up and can not be freed by user process waiting for
+		response, that user process is locked on DlcWriteLock because 
+		of pipelining.  The Write will complete if an ACK for previously
+		sent data is received.  However if server is sending a data frame, 
+		which causes length errors since the short buffer does not have
+		enough space.  If an ack is sent as a response, the server may
+		keep sending data frames.  If it is ignored then ping will be
+		sent because of the outstanding data frame at regular timeouts,
+		so nothing needs to be done if usingShortRxBuffer */
+
+		IF NOT usingShortRxBuffer THEN pingOrDataReceived = TRUE;
+		END;
+	CALL VipcProcessDataLinkEvent (Dlc_Ex_PrintDlcMsg, 0, error);
+END ProcessErrorInReceive;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ProcessFrame: a frame is successfully received. This routine is 
+&	called from an Interrupt Service Routine (or Emulator).  
+&	Do as much processing as possible in here given the restrictions of 
+&	ISRs and signal the IsMain process using flags etc. for rest of it.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ProcessFrame: PROCEDURE (pRxBufferDesc, usingShortRxBuffer) CLEAN;
+DCL pRxBufferDesc	POINTER,
+	RxShortFrame	BASED pRxBufferDesc RxShortBufferDescType,
+	RxLongFrame		BASED pRxBufferDesc RxLongBufferDescType;
+
+DCL usingShortRxBuffer	BOOLEAN;
+DCL frameType		BYTE;
+DCL dummy			WORD;
+
+	frameType = RxLongFrame.frameType;
+
+$IF Debugging
+	IF DlcIOTraceMaskSet AND (NOT intDrivenMaskSet) THEN
+		DO;
+		DCL msg2 CharStr ('rcvd RFC '),
+			msg3 CharStr ('rcvd ACK '),
+			msg4 CharStr ('rcvd DISC'),
+			msg5 CharStr ('rcvd PING'),
+			msg6 CharStr ('rcvd DATA');
+
+		IF (frameType > 0) AND (frameType <= DataType) THEN 
+			DO;
+			DO CASE frameType-1;
+				/* 1 : Request for conn */	CALL ConLineOUt (@msg2, size(msg2));
+				/* 2 : Acknowledgment	*/	CALL ConLineOUt (@msg3, size(msg3));
+				/* 3 : Disconnect		*/	CALL ConLineOUt (@msg4, size(msg4));
+				/* 4 : Request for Ack	*/	CALL ConLineOUt (@msg5, size(msg5));
+				/* 5 : User Data		*/	CALL ConLineOUt (@msg6, size(msg6));
+		  		END;  /* case frameType */
+
+			CALL HexByteOut (RxShortFrame.seqNumber);
+	
+    		IF frameType = RfcType THEN
+				DO;
+				CALL HexByteOut (RxShortFrame.pdlConn);
+				CALL HexOut (RxShortFrame.pdlVersion);
+				END;
+
+			ELSE IF frameType = DataType THEN
+    			DO;
+				DCL msg CharStr (' data length =');
+				CALL ConLINeOut (@msg, size (msg));
+				CALL Hexout (RxLongFrame.RxLength-4);
+				END;
+			END;
+		CALL newline;
+		END;
+$ENDIF
+$EJ
+
+	IF (frameType > DataType) OR (frameType = 0) THEN
+		DO;
+$		IF Debugging
+		IF NOT intDrivenMaskSet THEN
+			DO;
+			DCL msg CharStr ('Invalid Frame Rcvd: ');
+ 			CALL ConLineOUt (@msg, size(msg));
+			CALL HexByteOut (frameType);
+			CALL newline;
+			END;
+$		ENDIF
+		CALL ProcessErrorInReceive (eInvalidFrame, TRUE);
+		invalidFrames = invalidFrames + 1;
+		RETURN;
+		END;
+
+	IF frameType = DiscType 
+		THEN CALL StartDisconnect (eDlcRemoteDisconnect);
+
+	ELSE IF currentState = SxConnecting THEN
+		DO;
+		IF frameType = RfcType THEN
+			DO;
+			SendSequence = RxShortFrame.seqNumber + 1;
+			RecvSequence = RxShortFrame.seqNumber;
+			AckSequence = RxShortFrame.seqNumber;
+			ConnectionID = RxShortFrame.pdlConn;
+			currentState = SxConnected;
+			/* although the state is changed, duplicate rfc's may be rcvd */
+			OkToRcvRfc = TRUE;
+			CALL SetTimer (idlePingTimeOut);
+			CALL OsSignal (TxBufferDesc.writeComplete, signalMode, 0, @dummy);
+			CALL VipcProcessDataLinkEvent (Dlc_Ex_Started, 0, eOk);
+			RETURN;
+			END;
+		ELSE 
+			DO;
+			invalidFrames = invalidFrames + 1;
+$			IF Debugging
+			CALL VipcProcessDataLinkEvent 
+					(Dlc_Ex_PrintDlcMsg, 0, ePdlProtocolError);
+			IF NOT intDrivenMaskSet THEN
+				DO;
+				DCL msg CharStr 
+					('Protocol Error in connecting state/frameType = ');
+				CALL ConLineOut (@msg, size (msg));
+				CALL HexByteOut (frameType);
+				CALL newline;
+				END;
+$			ENDIF
+
+			CALL StartDisconnect (eDlcProtocolError);
+			END;
+		END;
+$EJ
+	ELSE IF currentState = SxConnected THEN
+		DO;
+	  	IF (frameType = RfcType) AND OkToRcvRfc THEN RETURN;
+		ELSE OkToRcvRfc = FALSE;
+
+		IF frameType = AckType THEN
+			DO;
+		  	IF ConnectionID <> RxShortFrame.PdlConn THEN 
+				DO;
+				invalidFrames = invalidFrames + 1;
+$IF Debugging	
+				IF NOT intDrivenMaskSet THEN
+			 		DO;
+					DCL msg CharStr 
+						('Protocol Error in connecting state/frameType = ');
+					CALL ConLineOut (@msg, size (msg));
+					CALL HexByteOut (frameType);
+					CALL newline;
+					END;
+$ENDIF
+				CALL StartDisconnect (eDlcProtocolError);
+				END;
+				
+			IF SendOutStanding THEN
+				DO;
+		  		IF RxShortFrame.seqNumber = ((AckSequence + 1) 
+			      		MOD seqNumModulo) THEN
+			  		DO;	
+					/* this is ack for last frame, update ack number */
+			  		AckSequence = RxShortFrame.seqNumber;
+					framesSent = framesSent + 1;
+					CALL CompleteWriteRequest (eOk);
+					CALL SetTimer (idlePingTimeOut);	
+						/* Now ping every 10 seconds */
+			  		END;  /* this is ack for last frame */
+
+				/* if a ping was sent just before data then an ack for the last 
+				data frame may be received before ack for the current data
+				frame.  No need to retransmit if so.  PingOutstanding will
+				be true if so. */
+
+				ELSE IF pingOutStanding 
+							AND (RxShortFrame.seqNumber = AckSequence) THEN
+					DO;
+					pingOutStanding = FALSE;
+					idlePingRetries = 0;
+					END;
+				ELSE 
+					DO;
+$IF Debugging	
+					IF DlcErrorsMaskSet AND (NOT intDrivenMaskSet) THEN
+				 		DO;
+						DCL msg CharStr 
+							('NACK Rcvd, Seq #');
+						CALL ConLineOut (@msg, size (msg));
+						CALL HexByteOut (RxShortFrame.seqNumber);
+						CALL newline;
+						END;
+$ENDIF
+					nackReceived = TRUE;
+					END;
+				END;
+
+			ELSE 
+				DO;
+				pingOutStanding = FALSE;
+				idlePingRetries = 0;
+				IF (RxShortFrame.seqNumber <> AckSequence) THEN
+					DO;
+$					IF Debugging
+					CALL VipcProcessDataLinkEvent 
+						(Dlc_Ex_PrintDlcMsg, 0, eIllegalAck);
+					IF NOT intDrivenMaskSet THEN
+						DO;
+						DCL msg CharStr ('Received Illegal ACK/expected:');
+						CALL ConLineOut (@msg, size(msg));
+						CALL HexByteOut (RxShortFrame.seqNumber);
+						CALL HexByteout (AckSequence);
+						CALL newline;
+						END;
+$					ENDIF
+					invalidSeqCnt = invalidSeqCnt + 1;
+					END;
+				END;
+		  	END;
+
+		ELSE IF (frameType = DataType) THEN
+			DO;
+			idleTime = 0;
+			IF NOT usingShortRxBuffer THEN
+				DO;
+			  	IF RxLongFrame.seqNumber = ((RecvSequence + 1) MOD seqNumModulo)
+				THEN
+					DO;  /* this is next data packet */
+					RecvSequence = RxLongFrame.seqNumber;
+					RxBufferFree = false;
+					framesRcvd = framesRcvd + 1;
+					CALL VipcProcessDataLinkEvent (Dlc_Ex_FrameArrived,
+									 @RxLongFrame.DlcDataArea, eOk);
+					END;  /* this is next data packet */
+
+				ELSE IF (RxLongFrame.seqNumber = RecvSequence) THEN
+					DO;
+					duplicatesRcvd = duplicatesRcvd + 1;
+$					IF Debugging
+					CALL VipcProcessDataLinkEvent 
+						(Dlc_Ex_PrintDlcMsg, 0, eDuplicatesRcvd);
+					IF DlcErrorsMaskSet AND (NOT intDrivenMaskSet) THEN
+						DO;
+						DCL msg CharStr ('Rcvd Duplicate Data, Seq #');
+						CALL ConLineOut (@msg, size(msg));
+						CALL HexByteOut (RxLongFrame.seqNumber);
+						CALL newline;
+						END;
+$					ENDIF
+					END;
+
+				ELSE
+					DO;
+$					IF Debugging
+					CALL VipcProcessDataLinkEvent 
+							(Dlc_Ex_PrintDlcMsg, 0, eIllegalDataSeq);
+					IF not intDrivenMaskSet THEN
+						DO;
+						DCL msg CharStr ('Received Illegal data seq/expected:');
+						CALL ConLineOut (@msg, size(msg));
+						CALL HexOut (RxShortFrame.seqNumber);
+						CALL Hexout (RecvSequence);
+						CALL newline;
+						END;
+$					ENDIF
+					invalidSeqCnt = invalidSeqCnt + 1;
+					END;
+			
+				pingOrDataReceived = TRUE;
+				END;
+			END;
+
+		ELSE IF (frameType = pingType) THEN 
+			DO;
+$IF Debugging	
+			IF DlcErrorsMaskSet AND (NOT intDrivenMaskSet) THEN
+				DO;
+				DCL msg CharStr ('PING Rcvd',cr,lf);
+				CALL ConLineOut (@msg, size (msg));
+				END;
+$ENDIF
+			pingOrDataReceived = TRUE;
+			END;
+
+		ELSE 
+			DO;
+			invalidFrames = invalidFrames + 1;
+$			IF Debugging
+			CALL VipcProcessDataLinkEvent 
+					(Dlc_Ex_PrintDlcMsg, 0, ePdlProtocolError);
+			IF NOT intDrivenMaskSet THEN
+				DO;
+				DCL msg CharStr 
+					('Protocol Error in conencted state/frameType = ');
+					CALL ConLineOut (@msg, size (msg));
+					CALL HexByteOut (frameType);
+					CALL newline;
+				END;
+$			ENDIF
+			CALL StartDisconnect (eDlcProtocolError);
+			END;
+
+		END;	/* connected State */
+
+	/* in other states do nothing */
+
+END ProcessFrame;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	PingForAck
+&
+&	After sending a data frame, If no response is 
+&	received then send pings 3 seconds requesting an AcK
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PingForAck: PROCEDURE REENTRANT;
+	IF (pingRetries := pingRetries + 1) < MaxPingRetries  THEN
+		DO;
+$IF Debugging
+		IF DlcErrorsMaskSet THEN 
+			DO;
+			DCL msg CharStr ('Sending PING For Ack, Retry #');
+			CALL ConLineOUt (@msg, size(msg));
+			CALL DecimalOut (pingRetries);
+			CALL newline;
+			END;
+$ENDIF
+		/* send retries not exceeded */ 
+		CALL SendShortFrame (PingType); 
+		CALL SetTimer (pingForAckTimeOut);
+
+		totalPings = totalPings + 1;
+		IF pingRetries > maxPings THEN maxPings = pingRetries;
+		END;
+	ELSE CALL StartDisconnect (eDlcTooManyRetries);
+END PingForAck;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	RetryData - resend a frame of user data
+&
+&	After sending a data frame, If no response is 
+&	received then ping's are sent every 2 seconds.  
+&	An out of seq ack rcvd is interpreted as a nack
+&	and data is retransmitted.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+RetryData: PROCEDURE REENTRANT;
+	IF (dataRetries := dataRetries + 1) <= MaxDataRetries THEN
+		DO;
+		CALL SendDataFrame;  	/* resend user data */
+		CALL SetTimer (pingForAckTimeout);		/* next ping after 3 seconds */
+		CALL ResetTimer;
+		END;
+	ELSE CALL DisconnectDlc (eDlcTooManyRetries);
+
+	totalRetries = totalRetries + 1;
+	IF dataRetries > maxRetries THEN maxRetries = dataRetries;
+END RetryData;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	CompleteWriteRequest
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+CompleteWriteRequest: PROCEDURE (error) REENTRANT;
+
+	DCL (error, dummy) WORD;
+
+	IF curTxBufDesc.ReadyForTx THEN
+		DO;
+		sendOutstanding = false;
+		pingRetries = 0;
+
+		curTxBufDesc.ReadyForTx = FALSE;
+ 		IF curTxBufDesc.synchronous 
+			THEN CALL OsSignal (curTxBufDesc.writeComplete, signalMode, 
+								error, @dummy);
+
+		/* Release write lock */
+  		CALL OsSignal (DlcWriteLock, signalMode, error, @dummy);
+		END;
+END CompleteWriteRequest;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	StartDisconnect
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+StartDisconnect: PROCEDURE (reason) REENTRANT;
+DCL reason 		WORD;
+DCL flag		WORD;
+
+	flag = FLAGS;
+	DISABLE;
+	IF (currentState <> SxDisconnected) AND (currentState <> SxDisconnecting)
+	THEN
+		DO;
+		lastState = currentState;
+		currentState = SxDisconnecting;
+		reasonForDlcDeath = reason;
+		END;
+	FLAGS = flag;	/* restore interrupt condition */
+	/* Send IdlePollTwitch to make sure that DlcProcess is woken up quickly 
+	to complete the disconnect */
+	CALL VipcProcessDataLinkEvent (Dlc_Ex_IdlePollTwitch, 0, 0);
+END StartDisconnect;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DisconectDlc
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DisconnectDlc: PROCEDURE (reason) CLEAN;
+DCL reason 	WORD;
+DCL dummy	WORD;
+	DISABLE;
+	IF currentState = SxDisconnected THEN 
+		DO;
+		ENABLE;
+		RETURN;
+		END;
+	currentState = SxDisconnected;
+	ENABLE;
+	CALL SendShortFrame (discType);
+	/* Now delay so that the server side can complete sending a disconnect
+	frame.  11 characters @1200 baud take 91.67 ms */
+
+	CALL OsDelay (150);		
+	CALL ModemStop;
+	IF lastState = SxConnecting THEN CALL OsSignal (TxBufferDesc.writeComplete,
+											signalMode, 
+											reason, 
+											@dummy);
+	CALL CompleteWriteRequest (reason);
+$IF Debugging
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Signalling Disconnect to Vipc',cr,lf);
+		CALL ConLineOUt (@msg, size (msg));
+		END;
+$ENDIF
+	CALL VipcProcessDataLinkEvent (Dlc_Ex_Disconnected, 0, reason);
+END DisconnectDlc;
+
+
+END IsEmulator;

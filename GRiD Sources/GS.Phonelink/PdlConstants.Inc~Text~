@@ -1,0 +1,92 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*
+*				COMPASS CENTRAL Phone DATA LINK CONTROL
+*
+*	includeFile:	Pdl State, Event and other misc constants
+*
+*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL empty 	LIT '0ffffh';
+DCL cr		LIT  '0Dh',
+	lf		LIT  '0Ah';
+
+DECLARE /* Pdl event defines: */
+
+	PdlExTxReady			LIT  '1',
+
+	PdlExRcvIrError			LIT  '2',
+	PdlExRcvRecError		LIT  '3',
+
+	PdlExRcvdRfc			LIT  '4',
+	PdlExRcvdDisc			LIT  '5',
+	PdlExRcvdAck			LIT  '6',
+	PdlExRcvdPing			LIT  '7',
+	PdlExRcvdData			LIT  '8',
+	PdlExRcvdNoBuffer		LIT  '9',
+
+	PdlExStartFlush			LIT  '11',
+	PdlExFlushDone			LIT  '12',
+	PdlExFIOAborted			LIT  '13',
+
+	PdlExMinDlcRequest		LIT	 '16',
+
+	PdlExDlcConfigure		LIT	 '16',	
+	PdlExDlcAttachRequest	LIT  '17',
+	PdlExDlcDetachRequest	LIT  '18',
+	PdlExDlcConnRequest		LIT  '19',
+	PdlExDlcDiscRequest		LIT  '20',
+	PdlExDlcSendRequest		LIT  '21',
+	PdlExDlcReceiveRequest	LIT  '22',
+	PdlExDlcFlushRequest	LIT  '23',
+	PdlExDlcResetRequest	LIT  '24',
+	PdlExDlcStatusRequest	LIT  '25',
+	PdlExDlcControlRequest	LIT  '26',
+
+	PdlExMaxDlcRequest		LIT  '26',
+
+	PdlExRetriesOk			LIT  '29',
+	PdlExRetriesExhausted	LIT  '30',
+	PdlExRecvdNoBufferf		LIT  '31',
+	PdlExRecvdNoBuffernf	LIT  '32',
+	PdlExRecvdInvalid		LIT  '33',
+	PdlExXmitComplete		LIT  '34',
+
+	PdlExResponseTimeOut	LIT  '35',
+	PdlExPollTimeOut		LIT  '36',
+	PdlExUserTimeOut		LIT  '37',
+	PdlExRcvdDcdOn			LIT  '38',
+	PdlExRcvdInvalidFrame	LIT  '254',
+	PdlExBadEvent			LIT  '255';
+
+
+DECLARE		/*  States of Pdl machine  */
+
+	PdlSxClosed				LIT  '1',
+	PdlSxConnecting			LIT  '2',
+	PdlSxConnected			LIT  '3',
+	PdlSxDisconnecting		LIT  '4',
+	PdlSxListening			LIT  '5';
+
+/*  frame type codes  */
+DCL RfcType   LIT '1',
+    AckType   LIT '2',
+    DiscType  LIT '3',
+    PingType  LIT '4',
+    DataType  LIT '5';
+
+DCL PdlWindowSize  LIT '1',    /* one outstanding frame */
+    EomFlagOn      LIT '01h';  /* set the End of message flag */
+
+DCL sendRetryMax   LIT '16',    /* 10 attempts to send */
+    rfcTimeoutMax  LIT '3000',  /* 3 seconds between rfc resends */
+    sendTimeoutMax LIT '5000',  /* 5 seconds between resends */
+    pingTimeoutMax LIT '10000', /* 10 seconds between link-maintaining pings */
+/* raised to 30 seconds for MNP modem negotiation time by W. Strang 12/14/90 */
+	rfcWaitTime    LIT '30000',	/* Wait 30 seconds for rfc to arrive */
+/*	rfcWaitTime    LIT '10000',*/	/* Wait 10 seconds for rfc to arrive */
+
+	activityTimeOutMax  	LIT '60000', /* 60 sec  = 1 min */
+    activityTimerCountMax	LIT '3';	 /* to get activity timeout of 3 min */
+
+DCL RfcFiller LIT '0AAh';   /* bit pattern used by GC to detect line speed */
+

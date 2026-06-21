@@ -1,0 +1,981 @@
+$TITLE ('Compass Central Phone Data Link: Action Module 1')
+$COMPACT OPTIMIZE(3)
+$SET(phoneLink) SET(ActionModule)
+
+PdlActionModule: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*
+*				COMPASS CENTRAL Phone DATA LINK CONTROL
+*
+*	This module contains the following action routines:
+*
+*			tbd
+*
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+
+$SAVE NOLIST
+
+$INCLUDE (``Incs`Plm.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.inc~text~)
+$INCLUDE (``Incs`ConPlmProcs.inc~text~)
+$INCLUDE (``Incs`MovRtns.Plm.inc~text~)
+
+$INCLUDE (``ccIncs`DataCommDefines.inc~text~)
+$INCLUDE (``ccIncs`MachineDefines.Inc~Text~)
+
+$INCLUDE (PdlConstants.Inc~Text~)
+$INCLUDE (PdlMachineDefines.Inc~Text~)
+$INCLUDE (NewErrors.Inc~Text~)
+$INCLUDE (SelectedDlcActions.inc~text~)
+$INCLUDE (SelectedGeneral.inc~text~)
+
+$INCLUDE (``ccIncs`DlcMsgDefines.inc~text~)
+$INCLUDE (``ccIncs`MemoryDefines.inc~text~)
+$INCLUDE (``ccIncs`MacModule.inc~text~)
+$INCLUDE (``ccIncs`UtlModule.inc~text~)
+$INCLUDE (``ccIncs`TimerModule.inc~text~)
+
+$INCLUDE (Gs.Pdl.Ext.Inc~text~)
+
+DCL	doubleNull	LIT	'0ffffffffh';
+
+$IF Debug OR Debug1
+CrLf: PROCEDURE;
+	CALL ConLineOut(@(cr, lf), 2);
+END CrLf;
+$ENDIF
+
+$RESTORE
+$INCLUDE (GlobalVariables~Text~)
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*				PdlExecuteMachine
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlExecuteMachine: PROCEDURE (linkNumber, sDlCB) PUBLIC;
+
+DCL linkNumber			WORD;
+
+DCL sDlCB				SELECTOR,
+	dlCB				BASED sDlCB STRUCTURE (DlCBgenDescriptor);
+
+DCL error				WORD;
+
+DCL scurMachine			SELECTOR,
+	curMachine			BASED 	scurMachine	PdlStateMachineType;
+
+DCL sShortFrame			SELECTOR;	/* used by some action routines */
+
+DCL ActionProcedure		WORD;
+
+$INCLUDE (PdlStateTransitionTables~Text~)
+
+DCL pTransitionTable	PTR,
+	transitionTable		BASED pTransitionTable (1) TransitionTblEntry;
+
+DCL p					WORD,
+	event				WORD;
+
+
+	/* All the action routines are in alphabetical order */
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcChkActivityTimeOut:
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcChkActivityTimeOut: PROCEDURE;
+	
+		IF NOT curMachine.activeConnect THEN
+		DO;
+			IF (ActivityTimerCount := ActivityTimerCOunt + 1)
+												>= ActivityTimerCOuntMax THEN
+				CALL StartDiscFlushing (scurMachine, eDlcActivityTimeOut);
+			ELSE
+				DO;
+					CALL TmrStartPollTimeout(sCurMachine);
+$IF Debug
+					CALL ConLineOut(@('Started poll timer', cr, lf), 20);
+$ENDIF
+				END;
+		END;
+		ELSE
+			DO;
+				curMachine.pollTimerOn = FALSE;
+				IF NOT (curMachine.sendOutstanding or
+											curMachine.ackOutstanding) THEN
+				DO;
+					curMachine.ackOutstanding = TRUE;
+					curMachine.pingSent = TRUE;
+					CALL SendShortFrame(sCurMachine, pingType);
+					CALL TmrStartResponseTimeout(sCurMachine);
+$IF Debug
+					CALL ConLineOut(@('Sent ping, started resp tmr', cr, lf),
+																			20);
+$ENDIF
+				END;
+			END;
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*				PdlAcChkXmitComplete
+	*
+	*		If error and not already flushing then start flushing.
+	*		If data
+	*			if flushing or acknowledged or error
+	*				then return it.
+	*			else start response timer.
+	*		else
+	*			if disc then 
+	*				discXmitCompleted
+	*				disc line
+	*				if DiscRequest is received then
+	*					completeDisc
+	*			free dlCB
+	*		
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcChkXmitComplete: PROCEDURE;
+
+	DCL dlCB BASED sDlCB STRUCTURE (DlCBgenDescriptor, DlCBIoDataParams),
+		pBuffer	PTR,
+		buffer	BASED pBuffer STRUCTURE (PdlcHeader);
+
+$IF Debug
+		IF dlcB.reqError <> 0 THEN
+		DO;
+			DCL msg CharStr ('Irrecoverable error on Tx complete: ');
+			CALL ConLineOUt (@msg, size(msg));
+			CALL ConHexOut(dlcB.reqError);
+			CALL CrLf;
+		END;
+$ENDIF
+		IF (dlCB.dataLength AND bufferTypeMask) = msgWithBufferPtr THEN
+			pBuffer = dlCB.pBuffer;
+		ELSE
+			pBuffer = @dlCB.pBuffer;
+
+		IF (dlCB.reqError <> 0) AND (NOT curMachine.flushing) AND
+											(buffer.frameType <> discType) THEN
+		    CALL StartDiscFlushing(scurMachine, dlCB.reqError);
+
+		IF ((dlCB.msgFormat AND msgDlcFormatMask) = macFrameOutInfo) THEN
+		DO;
+			/* A write has been completed, If ack has already arrived
+				then return the buffer.  If ack has not arrived, just reset
+				sendoutstanding. */
+
+			IF NOT curMachine.sendOutstanding THEN
+				CALL OsLogError(2, 0ffffh, linkNumber, @(10, 'Pdl Act 01'));
+				   
+			curMachine.sendOutStanding = FALSE;
+			IF (dlCB.reqError <> 0) OR (NOT curMachine.ackOutstanding)
+								         		OR (curMachine.flushing) THEN
+				CALL CompleteSendRequest (scurMachine);
+			ELSE
+				IF curMachine.reSendRequired THEN 
+				DO;
+					curMachine.resendRequired = FALSE;
+					CALL ResendCurUserFrame (scurMachine);
+$IF Debug
+					CALL ConLineOut(@('Resending frame', cr, lf), 17);
+$ENDIF
+				END;
+			ELSE
+				DO;
+					CALL TmrStartResponseTimeOut (scurMachine);
+$IF Debug
+					CALL ConLineOut(@('Started resp timer', cr, lf), 20);
+$ENDIF
+				END;
+		END;
+
+		ELSE 
+	     	DO;
+				IF buffer.frameType = discType THEN
+				DO;
+					curMachine.discXmitCompleted = TRUE;
+					CALL MacDisablePoll(curMachine.linkNumber);
+
+					/* Disc has been sent, If discReq is already issued then 
+            			complete disconnect and change the state.  A disconnect 
+						request will not be outstanding unless user flush is
+						done. */
+					IF curMachine.userRequestCB <> nullword THEN
+		    	    	CALL CompleteDisc (scurMachine);
+$IF Debug
+					CALL ConLineOut(@('Disc complete', cr, lf), 15);
+$ENDIF
+				END;
+		       	CALL AcFreeCB (NULLWORD, sDlCB);	/* it is a short frame */
+			END;
+
+	END PdlAcChkXmitComplete;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcCompleteDisc: 
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcCompleteDisc: PROCEDURE;
+
+		IF curMachine.flushing  THEN
+			CALL GenReturnUserRequest (scurMachine, sDlCB, eDlcInvalidRequest);
+		ELSE 
+			DO;
+				curMachine.userRequestCB = sDlCB;
+				IF curMachine.discXmitCompleted THEN
+			  		CALL CompleteDisc (scurMachine);
+			END;
+	END PdlAcCompleteDisc;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcCompleteFlush: 
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcCompleteFlush: PROCEDURE;
+
+	/* The disconnect flush has already started,  If it is finished then
+		return this request, else save sDlCB and the request will be
+		returned by FlushSendQueue */
+
+		IF curMachine.flushing THEN curMachine.userFlushCB = sDlCB;
+		ELSE 
+		 	DO;
+				curMachine.userFlushed = TRUE;
+				CALL GenReturnUserRequest (scurMachine, sDlCB, eOK);
+			END;
+
+	END PdlAcCompleteFlush;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcFreeCB
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcFreeCB: PROCEDURE;
+
+		/* called by Error on received frame, just ignore it */
+		CALL AcFreeCB (NULLWORD, sDlCB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcConnect: Process a connect
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcConnect: PROCEDURE;
+
+	DCL	connCB			BASED sDlCB
+							STRUCTURE (DlCBGenDescriptor, DlCBConnParams),
+		activeConnCB	BASED sDlCB
+							STRUCTURE (DlCBGenDescriptor, DlCBActiveConnParams),
+		error	WORD;
+
+		IF (curMachine.state <> PdlSxClosed) AND (curMachine.activeConnect OR
+											(NOT connCB.accessActivity)) THEN
+		DO;
+			CALL GenReturnUserRequest(sCurMachine, sDlCB, eDlcInvalidRequest);
+			RETURN;
+		END;
+		ELSE
+			IF curMachine.state <> PdlSxClosed THEN
+			DO;
+				CALL TmrAbortTimeout(sCurMachine, tmrUserTimer);
+				curMachine.userRequestCB = UtlFreeCB(curMachine.userRequestCB);
+				CALL MacDisablePoll(linkNumber);
+			END;
+
+		curMachine.abortReported, curMachine.pingSent, curMachine.pollTimerOn
+																		= FALSE;
+		curMachine.currentRetries = 0;
+		IF connCB.accessActivity THEN
+		DO;
+$IF Debug1
+			CALL ConLineOut(@('Pdl: Active connect', cr, lf), 21);
+$ENDIF
+			curMachine.responseTime = rfcTimeoutMax;
+			curMachine.pollTime = pingTimeoutMax;
+			curMachine.nextState = PdlSxConnecting;
+			curMachine.activeConnect = TRUE;
+			curMachine.userTime = activeConnCB.timeout;
+			curMachine.userRequestCB = sDlCB;
+			CALL MacEnablePoll(linkNumber);
+			CALL MacSetDiscTimeout(linkNumber, activeConnCB.waitForAnswer);
+			CALL MacConfigureModem(linkNumber);
+			CALL MacSetDcdDetect(linkNumber);
+			IF activeConnCB.phoneNumber(0) <> 0 THEN
+				CALL MacDialOut(linkNumber, @activeConnCB.phoneNumber,
+													activeConnCB.linkSpeed);
+			IF MacDcdOn(linkNumber) THEN
+			DO;
+				CALL SendShortFrame(sCurMachine, rfcType);
+				curMachine.nextState = PdlSxListening;
+				CALL TmrStartResponseTimeout(sCurMachine);
+			END;
+			ELSE
+				IF curMachine.userTime <> doubleNull THEN
+				DO;
+					curMachine.userRequestCB = nullWord;
+					CALL TmrStartUserTimeout(sCurMachine, sDlCB);
+$IF Debug
+					CALL ConLineOut(@('Started user timer', cr, lf), 20);
+$ENDIF
+				END;
+		END;
+		ELSE
+			DO;
+$IF Debug1
+				CALL ConLineOut(@('Pdl: Passive connect', cr, lf), 22);
+$ENDIF
+				curMachine.responseTime = sendTimeoutMax;
+				curMachine.pollTime = activityTimeoutMax;
+				curMachine.userTime = doubleNull;
+				curMachine.activeConnect = FALSE;
+				curMachine.userRequestCB = sDlCB;
+				CALL MacEnablePoll(linkNumber);
+				CALL MacConfigureModem(linkNumber);
+$IF Debug
+				CALL ConLineOut(@('Enabled poll', cr, lf), 14);
+$ENDIF
+			END;
+
+	END PdlAcConnect;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcHangUpAndListen: Process a HangUpAndListen
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcHangUpAndListen: PROCEDURE;
+
+		CALL TmrAbortTimeout(sCurMachine, tmrUserTimer);
+		CALL AcFreeCB(NULLWORD, sDlCB);
+		CALL MacDisablePoll(linkNumber);
+		IF NOT curMachine.activeConnect THEN
+		DO;
+			CALL MacEnablePoll(linkNumber);
+			CALL MacConfigureModem(linkNumber);
+		END;
+		ELSE
+			DO;
+				CALL TmrAbortTimeOut(scurMachine, tmrResponseTimer);
+				curMachine.nextState = PdlSxClosed;
+				sDlCB = curMachine.userRequestCB;
+				curMachine.userRequestCB = nullWord;
+				CALL GenReturnUserRequest(sCurMachine, sDlCB, eMacDcdDropped);
+			END;
+	END PdlAcHangUpAndListen;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessAck
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessAck: PROCEDURE;
+
+	DCL ioDlCB		BASED sDlCB STRUCTURE (DlCBGenDescriptor,
+											DlCBioDataParams);
+	DCL pBuffer		PTR,
+		buffer 		BASED pBUffer STRUCTURE (PdlcHeader,
+											connectionID BYTE);
+	DCL sDataDlcB	SELECTOR,
+		dataDlCB	BASED sDlCB STRUCTURE (DlCBGenDescriptor,
+											DlCBioDataParams);
+
+		CALL TmrAbortTimeOut (scurMachine, tmrResponseTimer);
+$IF Debug
+		CALL ConLineOut(@('Ack received', cr, lf), 14);
+		CALL ConLineOut(@('Aborted resp timer', cr, lf), 20);
+$ENDIF
+		IF (ioDlCB.dataLength AND bufferTypeMask) = msgWithBufferPtr THEN
+			pBuffer = ioDlCB.pBuffer;
+		ELSE
+			pBuffer = @ioDlCB.pBuffer;
+
+		IF buffer.connectionID = curMachine.connectionID THEN
+		DO;
+			IF (buffer.seqNumber = curMachine.vS) THEN
+			DO;
+				IF curMachine.ackOutStanding THEN
+				DO;
+					/* This ack satisfies the current send, so complete the send
+						request. If the xmt was returned by MAC then return it
+						to the user, else only reset ackoutstanding. */
+
+					curMachine.ackOutStanding, 
+					curMachine.resendRequired = FALSE;
+
+					curMachine.currentRetries = 0;
+				
+					IF NOT curMachine.sendoutstanding THEN
+						CALL CompleteSendRequest (scurMachine);
+
+				END;
+				/* ELSE duplicate ack - ignore */
+			END;
+
+			ELSE
+				IF (buffer.seqNumber = LOW (curMachine.vS - 1)) THEN
+				DO;
+					/* This is an ack for the last buffer, which can also mean
+						a nack for the current buffer, send the buffer again */
+
+					IF curMachine.ackOutstanding THEN
+					DO;
+						IF curMachine.pingSent THEN
+							CALL StartDiscFlushing(sCurMachine,
+														eDlcProtocolError);
+/* start 4/16/89 by W. Strang to improve operation with Hadron PRC-6064s */
+/* This code removed because it cuts off retries prematurely. 12/20/90 wps */
+/*						ELSE
+							IF curMachine.currentRetries = 0 THEN
+							DO;*/  /* Don't count as a NACK, since we haven't */
+								 /* even PINGed for the current buffer yet. */
+/*							END;*/ /* In fact, ignore this ACK completely. */
+/* end 4/16/89 by W. Strang to improve operation with Hadron PRC-6064s */
+						ELSE
+							IF (curMachine.currentRetries :=
+								curMachine.currentRetries + 1) >= sendRetryMax
+																			THEN
+							DO;
+								/* retries exhausted, drop the link */
+								IF NOT (curMachine.pingSent OR
+												curMachine.sendOutstanding) THEN
+									CALL ReturnSendRequest(sCurMachine);
+								CALL StartDiscFlushing (scurMachine,
+					     						 		eDlcRetriesExhausted);
+							END;
+						ELSE
+							IF curMachine.sendOutStanding THEN
+									curMachine.resendRequired = TRUE;
+						ELSE
+							CALL ReSendCurUserFrame (scurMachine);
+					END;
+				END;
+			ELSE
+				DO;
+					CALL OsLogError(2, eDlcRcvdInvalidAck, linkNumber,
+														@(10, 'Pdl Act 02'));
+					IF (NOT (curMachine.pingSent OR curMachine.sendOutstanding))
+											AND curMachine.ackOutstanding THEN
+						CALL ReturnSendRequest(sCurMachine);
+					CALL StartDiscFlushing(sCurMachine, eDlcRcvdInvalidAck);
+				END;
+		END;
+		ELSE 
+		 	DO;
+				CALL OsLogError(2, eDlcInvalidConnection, linkNumber,
+														@(10, 'Pdl Act 03'));
+				IF (NOT (curMachine.pingSent OR curMachine.sendOutstanding))
+											AND curMachine.ackOutstanding THEN
+					CALL ReturnSendRequest(sCurMachine);
+				CALL StartDiscFlushing(sCurMachine, eDlcInvalidConnection);
+			END;
+
+		CALL QueueReceive (sDlCB);
+	END PdlAcProcessAck;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessDcd
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessDcd: PROCEDURE;
+		CALL TmrAbortTimeout(sCurMachine, tmrUserTimer);
+$IF Debug
+		CALL ConLineOut(@('Aborted user timer', cr, lf), 20);
+$ENDIF
+		CALL OsDelay(1000);
+		CALL SendShortFrame(sCurMachine, rfcType);
+		CALL TmrStartResponseTimeout(sCurMachine);
+$IF Debug
+		CALL ConLineOut(@('Started user timer', cr, lf), 20);
+$ENDIF
+		CALL AcFreeCB (NULLWORD, sDlCB);
+	END PdlAcProcessDcd;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessLocalFlush:
+	*		A local flush is issued, start disconnect flushing.
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessLocalFlush: PROCEDURE;			
+
+	/* If the user initiates disconnect starting with flush then 
+		abort does not have to be reported */
+		curMachine.abortReported = TRUE;
+		curMachine.userFlushCB = sDlCB;
+		CALL StartDiscFlushing (scurMachine, eDlcLocalClosed);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessRcvIrError:
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessRcvIrError: PROCEDURE;
+		IF (NOT (curMachine.pingSent OR curMachine.sendOutstanding)) AND
+											curMachine.ackOutstanding THEN
+			CALL ReturnSendRequest(sCurMachine);
+		CALL StartDiscFlushing (scurMachine, dlcB.reqError);
+		CALL AcFreeCB (NULLWORD, sDlcB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessPing
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessPing: PROCEDURE;
+
+		/* simply send an ack */
+$IF Debug
+		CALL ConLineOut(@('Received ping', cr, lf), 15);
+$ENDIF
+		CALL SendShortFrame (scurMachine, AckType);
+		CALL QueueReceive (sDlCB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessReceivedInfo
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessReceivedInfo: PROCEDURE;
+	DCL ioDlCB			BASED sDlCB STRUCTURE (DlCBGenDescriptor,
+												DlCBioDataParams);
+
+	DCL pDataBuffer		PTR,
+		dataBuffer		BASED pDataBuffer STRUCTURE (pdlcHeader,
+													dataArea (1) BYTE);
+
+	DCL pdlcheaderPart	BASED sDummy STRUCTURE (PdlcHeader);
+
+		curMachine.active = TRUE;
+		
+		IF (ioDlCB.dataLength AND bufferTypeMask) = msgWithBufferPtr THEN
+			pDataBuffer = ioDlCB.pBuffer;
+		ELSE
+			pDataBuffer = @ioDlCB.pBuffer;
+
+		IF dataBuffer.seqNumber = LOW (curMachine.vR + 1) THEN
+		DO;
+			/* This is the next data packet */
+			curMachine.vR = curMachine.vR + 1;
+			ioDlCB.msgFormat = dlcReceive;
+			ioDlCB.dataLength = ioDlCB.dataLength - SIZE (pdlcHeaderPart);
+			CALL GenReturnUserRequest (scurMachine, sDlCB, 0);
+			CALL SendShortFrame (scurMachine, AckType);
+		END;
+
+		ELSE
+			IF dataBuffer.seqNumber = curMachine.vR THEN
+			DO;
+				CALL SendShortFrame (scurMachine, AckType);
+
+$IF Debug
+				CALL ConLineOut(@('Rcvd duplicate data Frame- seq#:'), 32);
+				CALL ConHexOut(databuffer.seqNumber);
+				CALL CrLf;
+$ENDIF
+
+				CALL QueueReceive (sDlCB);
+			END;
+		ELSE
+			DO;
+$IF Debug1
+				CALL ConLineOut(@('Protocol error1 '), 16);
+				CALL ConHexOut(databuffer.seqNumber);
+				CALL CrLf;
+$ENDIF
+				CALL OsLogError(2, 700, dataBuffer.seqNumber,
+											@(18, 'Pdl Bad sequence #'));
+				CALL OsLogError(2, 700, curMachine.vR,
+											@(18, 'Pdl Bad sequence #'));
+				CALL QueueReceive (sDlCB);
+				CALL ProtocolError(scurMachine);
+			END;
+	END PdlAcProcessReceivedInfo;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcProcessRemDisc:
+	*		A disconnect request is received from remote, start disconnect
+	*		procedures.
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcProcessRemDisc: PROCEDURE;			
+		CALL StartDiscFlushing (scurMachine, eDlcRemoteClosed);
+		CALL QueueReceive (sDlCB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcQueueReceive: Queue Buffer for receiving
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcQueueReceive: PROCEDURE;
+		CALL QueueReceive (sDlCB);
+	END PdlAcQueueReceive;
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcQueueSend: Queue Send Request
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcQueueSend: PROCEDURE;
+
+		/* dlCB.reqError = intCmpStatusWaiting; I may not need this */
+
+		IF (curMachine.sendOutstanding OR curMachine.ackOutstanding) THEN
+		 	CALL UtlPutQ (@curMachine.sendQhead, sDlCB);
+		ELSE 
+			DO;
+				curMachine.pollTimerOn = FALSE;
+				CALL TmrAbortTimeout(sCurMachine, tmrPollTimer);
+				curMachine.sSendDlCB = sDlCB;
+	           	/* I do not want MAC to free my message. So i will save
+		    	    freeDisp and set freeDisp to returnMsg. */
+				curMachine.freeDisp = dlCB.freeDisp;
+				dlCB.freeDisp = returnMsg;		
+				CALL sendCurUserFrame (scurMachine);
+			END;
+	END PdlAcQueueSend;
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcQueueSendIfFlushing: Queue Send Request
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcQueueSendIfFlushing: PROCEDURE;
+		IF curMachine.flushing THEN
+			CALL UtlPutQ (@curMachine.sendQhead, sDlCB);
+		ELSE
+			CALL GenReturnUserRequest (scurMachine, sDlCB,
+				   								 curMachine.irrecError);
+	END PdlAcQueueSendIfFlushing;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcReportBadRequest:
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcReportBadRequest: PROCEDURE;
+		CALL GenReturnUserRequest (scurMachine, sDlcB, eDlcInvalidRequest);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcReportConnected
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcReportConnected: PROCEDURE;
+
+	/* Send a response to rfc to the workstation, and return the connect
+			request to the dlc user */
+
+	DCL	pBuffer	POINTER;
+	DCL	buffer	BASED pBuffer STRUCTURE (pdlcHeader, connectionId BYTE,
+										version (2) BYTE);
+	DCL	dlCB	BASED sDlCB STRUCTURE (DlCBgenDescriptor, DlCBioDataParams);
+	DCL	done	BOOLEAN;
+
+		done = TRUE;
+		IF ((dlCB.dataLength AND bufferTypeMask) = msgWithBufferPtr) THEN
+			pBuffer = dlCB.pBuffer;
+		ELSE
+			pBuffer = @dlCB.pBuffer;
+
+		IF NOT curMachine.activeConnect THEN
+		DO;
+			CALL TmrAbortTimeout(sCurMachine, tmrUserTimer);
+			IF curMachine.protocolType = dlcOriginateProtocol THEN
+				done = FALSE;
+			ELSE
+				DO;
+					curMachine.vS,
+					curMachine.vR = RandomNumber;
+					curMachine.connectionID = (connectionID := connectionID+1); 
+					CALL SendShortFrame (scurmachine, rfcType);
+				END;
+		END;
+		ELSE
+			DO;
+				IF buffer.flags = EomFlagOn THEN
+				DO;
+					CALL TmrAbortTimeout(sCurMachine, tmrResponseTimer);
+					curMachine.connectionId = buffer.connectionId;
+$IF Debug
+					CALL ConLineOut(@('Aborted response timer', cr, lf), 24);
+$ENDIF
+					curMachine.vS, curMachine.vR = buffer.seqNumber;
+					curMachine.responseTime = sendTimeoutMax;
+				END;
+				ELSE
+					DO;
+						done = FALSE;
+						curMachine.currentRetries = sendRetryMax;
+						CALL OsLogError(2, eDlcRfcCrossover, linkNumber,
+										@(25, 'Pdl Rfc: Suberror = link#'));
+					END;
+			END;
+		CALL QueueReceive (sDlCB);
+
+		IF NOT done THEN
+		DO;
+			curMachine.nextState = nsc;
+			RETURN;
+		END;
+		
+		IF (sDlCB := curMachine.userRequestCB) <> nullword THEN
+		DO;
+$IF debug1
+			DCL	connCB	BASED sDlCB STRUCTURE (DlCBGenDescriptor,
+														DlCBConnParams);
+			IF connCB.accessActivity THEN
+				CALL ConLineOut(@('Pdl: Return active connect'), 26);
+			ELSE
+				CALL ConLineOut(@('Pdl: Return passive connect'), 27);
+			CALL CrLf;
+$ENDIF
+			CALL GenReturnUserRequest (scurMachine, sDlCB, eOk);
+			curMachine.userRequestCB = nullword;
+		END;
+		ELSE
+			CALL OsLogError(2, noUserTimer, linkNumber, @(10, 'Pdl Act 04'));
+			
+		CALL TmrStartPollTimeOut (scurMachine);
+$IF Debug
+		CALL ConLineOut(@('Started poll timer', cr, lf), 20);
+$ENDIF
+		curMachine.pollTimerOn = TRUE;
+		curMachine.pingSent = FALSE;
+		curMachine.currentRetries, activityTimerCount = 0;
+
+	END PdlAcReportConnected;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcResponseTimeout
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcResponseTimeOut: PROCEDURE;
+
+		IF (curMachine.currentRetries := curMachine.currentRetries + 1)
+														>= sendRetryMax THEN
+			DO;
+				/* retries exhausted, drop the link */
+				IF NOT (curMachine.pingSent OR curMachine.sendOutstanding) THEN
+					CALL ReturnSendRequest(sCurMachine);
+				CALL StartDiscFlushing (sCurMachine, eDlcRetriesExhausted);
+			END;
+		ELSE 
+			DO;
+				CALL SendShortFrame (sCurMachine, PingType);
+				CALL TmrStartResponseTimeOut (sCurMachine);
+$IF Debug
+				CALL ConLineOut(@('Started resp timer', cr, lf), 20);
+$ENDIF
+			END;
+	END PdlAcResponseTimeOut;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcRfcTimeout
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcRfcTimeout: PROCEDURE;
+		IF (curMachine.currentRetries := curMachine.currentRetries + 1) >=
+															sendRetryMax THEN
+		DO;
+			CALL MacDisablePoll(linkNumber);
+			CALL GenReturnUserRequest(sCurMachine, curMachine.userRequestCB,
+														eDlcRetriesExhausted);
+			curMachine.userRequestCB = NULLWORD;
+			curMachine.nextState = PdlSxClosed;
+		END;
+		ELSE
+			DO;
+				CALL SendShortFrame(sCurMachine, rfcType);
+				CALL TmrStartResponseTimeout(sCurMachine);
+$IF Debug
+				CALL ConLineOut(@('Started resp timer', cr, lf), 20);
+$ENDIF
+			END;
+	END PdlAcRfcTimeout;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcSendAck
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcSendAck: PROCEDURE;
+	
+	/* called if there was error on rcv */
+
+		CALL SendShortFrame (scurMachine, AckType);
+$IF Debug
+		CALL ConLineOut (@('Receive Error: '), 15);
+		CALL ConHexOut(dlcb.linkNumber);
+		CALL ConCharOut('/');
+		CALL ConHexOut(dlcb.reqError);
+		CALL CrLf;
+$ENDIF
+		CALL AcFreeCB (NULLWORD, sDlCB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcSendRfcRespIfNotActive
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcSendRfcRespIfNotActive: PROCEDURE;
+		IF curMachine.active THEN
+		DO;
+$IF Debug1
+			CALL ConLineOut(@('Protocol error2', cr, lf), 17);
+$ENDIF
+			CALL OsLogError(2, 700, curMachine.linkNumber,
+												@(18, 'Pdl Unexpected RFC'));
+			CALL ProtocolError (scurMachine);
+		END;
+		ELSE
+			IF NOT curMachine.activeConnect THEN
+				CALL SendShortFrame (scurMachine, rfcType);
+		CALL QueueReceive (sDlCB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcStartRfcTimeout
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcStartRfcTimeout: PROCEDURE;
+
+	DCL	connCB	BASED sDlCB STRUCTURE (DlCBGenDescriptor, DlCBConnParams);
+
+		CALL AcFreeCB (NULLWORD, sDlCB);	/* free dlcb */
+		sDlCB = curMachine.userRequestCB;
+		curMachine.userRequestCB = nullWord;
+		connCB.timeout, curMachine.userTime = rfcWaitTime;
+		CALL TmrStartUserTimeout(sCurMachine, sDlCB);
+	END;
+
+
+	/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+	*	PdlAcUserTimeout
+	&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	PdlAcUserTimeout: PROCEDURE;
+		CALL MacDisablePoll(linkNumber);
+		CALL GenReturnUserRequest(sCurMachine, curMachine.userRequestCB,
+																eDlcTimeout);
+		curMachine.userRequestCB = NULLWORD;
+	END PdlAcUserTimeout;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&  code for PdlExecuteMachine:
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	sCurMachine = stateMachines (linkNumber);
+
+	/* Get pointer to transition table for the state of the current state
+		machine */
+
+	pTransitionTable = transitionTablePtrs (curMachine.state - 1);
+	event = curMachine.event;
+	p = 0;
+	error = eOk;
+
+	DO WHILE transitionTable (p).event <> 0;
+		IF transitionTable (p).event = event THEN
+		DO;
+			curMachine.nextState = transitionTable(p).nextState;
+			actionProcedure = transitionTable (p).actionProcedure;
+
+$IF Debug
+			DO;
+				DCL nextState BYTE;
+				nextState = curMachine.nextState;
+				CALL ConLineOut 
+            	    	(@('Pdl Parse link#/Event/State/NextState:'), 38);
+				CALL ConHexOut (linkNumber);
+				CALL ConCharOut('/');
+				CALL ConHexOut (event);
+				CALL ConCharOut('/');
+				CALL ConHexOut (curMachine.State);
+				CALL ConCharOut('/');
+				CALL ConHexOut (nextState);
+				CALL CrLf;
+				CALL actionProcedure;
+				IF curMachine.nextState <> nextState THEN
+				DO;
+					DCL msg CharStr 
+			               ('Machine State Changed, link#/newState:');
+					CALL ConLineOut (@msg, size (msg));
+					CALL ConHexOut (linkNumber);
+					CALL ConCharOut('/');
+					CALL ConHexOut (curMachine.nextState);
+					CALL CrLf;
+				END;
+			END;
+$ELSE
+			CALL actionProcedure;
+$ENDIF
+
+			curMachine.event = 0;
+			IF curMachine.nextState <> nsc THEN
+				curMachine.state = curMachine.nextState;
+			RETURN;
+		END;
+		p = p + 1;
+	END;
+
+	/* If it comes here then the current event was not found in the
+		transition table for the current state.  If it is a user request
+		send it back at as invalid request, else it is a protocol error
+		Hang up the line and enter closed state */
+
+	IF (event >= PdlExMinDlcRequest) AND (event <= PdlExMaxDlcRequest) THEN
+	DO;
+$IF Debug
+		CALL ConLineOut (@('Invalid Dlc Request- link#/Event/State:'), 39);
+		CALL ConHexOut (linkNumber);
+		CALL ConCharOut('/');
+		CALL ConHexOut (event);
+		CALL ConCharOut('/');
+		CALL ConHexOut (curMachine.state);
+		CALL CrLf;
+$ENDIF
+		CALL GenReturnUserRequest (scurMachine, sDlcB,
+		   							 eDlcInvalidRequest);
+	END;
+
+	ELSE 
+		DO;
+$IF Debug1
+			CALL ConLineOut(@('Pdl Protocol Error- link#/Event/State:'),38);
+			CALL ConHexOut (linkNumber);
+			CALL ConCharOut('/');
+			CALL ConHexOut (event);
+			CALL ConCharOut('/');
+			CALL ConHexOut (curMachine.state);
+			CALL CrLf;
+$ENDIF
+ 			CALL AcFreeCB (scurMachine, sDlCB);
+			CALL OsLogError(11, 700, curMachine.state, @(13, 'Pdl Bad state'));
+			CALL OsLogError(11, 700, event, @(13, 'Pdl Bad state'));
+			CALL OsLogError(11, 700, linkNumber, @(13, 'Pdl Bad state'));
+			CALL ProtocolError (scurMachine);
+		END;
+
+END PdlExecuteMachine;
+
+
+END PdlActionModule;

@@ -1,0 +1,1183 @@
+$TITLE ('Virtual File System Calls - Part 2')
+$COMPACT OPTIMIZE(3) SET(Vfs2) SET (pipelinedRead)
+
+Vfs2: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	This is Vfs2.	It contains procedures to handle
+&	the following remote file system calls:
+&
+&		ddRead, ddWrite, ddReadDescriptor, ddWriteDescriptor
+&		ddSeek
+&
+&	PROCEDURES:
+&
+&	called from EntryPoint and VFS1:
+&
+&			FsRead
+&			FsWrite
+&			RemoteRead
+&			RemoteWrite
+&
+&	called from VFS1:
+&			RemoteSeek
+&			SendRequest
+&			ClearBuffer
+&			LocalFlush
+&
+&	called from Vipc:
+&			VfsResponseArrived
+&
+&	Local:
+&			Min
+&
+&	Author:	Rajendra Shah
+&	Start Date:	12/13/82
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+$EJECT
+$SAVE NOLIST
+	/* my favourite Plm literals */
+
+$INCLUDE (``Incs`Plm.Inc~Text~)
+
+	/* Os Constants, Types and Externals */
+
+$INCLUDE (``OsIncs`Os.Constant.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Error.Inc~Text~)
+$INCLUDE (``Incs`Errors.plm.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Device.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+
+	/* constants and types */
+
+$INCLUDE (VfsVipc.Constant.Inc~Text~)
+$INCLUDE (VfsVipcConnCB.Type.Inc~Text~)
+$INCLUDE (VfsVipc.Type.Inc~Text~)
+
+	/* Externals */
+
+$INCLUDE (Vipc.Ext.Inc~Text~)
+$INCLUDE (Twitch.Ext.Inc~Text~)
+
+WMin: PROCEDURE (a, b) WORD EXTERNAL;
+	DCL (a, b) WORD;
+	END;
+
+$RESTORE
+
+
+$IF debugging
+$SAVE Nolist
+$INCLUDE (Debug.Inc~Text~)
+$RESTORE
+$ENDIF
+
+DCL pVipcResponse	PTR;
+DCL pVfsResponse	PTR;
+
+$IF serverVfs
+DCL VfsResponseLock		WORD EXTERNAL;
+DCL VfsLayerLock		WORD EXTERNAL;
+DCL VfsLayerSignal		WORD EXTERNAL;
+$ENDIF
+
+$IF debugging
+DCL	debugMask	WORD EXTERNAL;
+$ENDIF
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&			Miscellaneous Support Routines
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&		ClearSignal:
+&
+&	If the expected signal arrives just after OsWait has timed out then the
+&	receive buffer may remain tied up.  Release the buffer if a signal has
+&	arrived in this small window.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ClearSignal: PROCEDURE (semID) REENTRANT;
+DCL error WORD;
+DCL note  WORD;
+DCL semID WORD;
+	/* don't wait at all */
+	note = OsWait (semId, 0, @error);
+	IF error = 0 THEN 
+		DO;
+$		IF Debugging
+			DCL msg CharStr ('Signal Found in ClearSignal',cr,lf);
+		CALL ConLineOUt (@msg, size (msg));
+$		ENDIF
+		CALL VfsFreeResponseBuffer;
+		END;
+END ClearSignal;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				ClearBuffer
+&	called by FsOpen, FsDelete, LocalFlush, FsSeek.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ClearBuffer: PROCEDURE (sVfsConnCB) CLEAN;
+	DCL sVfsConnCB	SELECTOR,
+		vfsConnCB	BASED sVfsConnCB	VfsConnCBType;
+
+	VfsConnCB.locBuffer,
+	VfsConnCB.lenBuffer,
+	VfsConnCB.pageDirty,
+	VfsConnCB.pageRead = 0;	/* same as fals */
+END ClearBuffer;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					LocalFlush
+&	This routine is called every time a call is made which requires that 
+&	the local buffer to be flushed.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+LocalFlush: PROCEDURE (sVfsConnCB) WORD CLEAN;
+	DCL sVfsConnCB	SELECTOR,
+		vfsConnCB	BASED sVfsConnCB	VfsConnCBType;
+
+	DCL error		WORD;
+	DCL cnt			WORD;
+
+	error = 0;
+	IF vfsConnCB.pageDirty 
+		THEN error = RemoteWrite (DOUBLE (ddWrite),
+									sVfsConnCB,
+									vfsConnCB.pPage,
+									vfsConnCB.lenBuffer);
+
+	cnt = vfsConnCB.lenBuffer - vfsConnCB.locBuffer;
+	
+	/* The file pointer on server now corresponds to the last byte in the local 
+	buffer.  If locBuffer is less than loc Buffer, than we need to send a 
+	backward seek to adjust for it */
+
+	IF (cnt > 0) THEN error = RemoteSeek (sVfsConnCB,
+									SeekRelBackwards,
+									DOUBLE (cnt));
+
+	CALL ClearBuffer (sVfsConnCB);
+	RETURN (error);
+END LocalFlush;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Remote Read
+&	Called for OsRead, OsReadDescriptor, OsGetStatus
+&	from FsRead and EntryPoint.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+RemoteRead: PROCEDURE (request, sVfsConnCB, pBuffer, pLength) WORD CLEAN;
+	DCL request		WORD;
+	DCL sVfsConnCB	SELECTOR,
+		vfsConnCB	BASED sVfsConnCB vfsConnCBType;
+
+	DCL connID		WORD	AT (@sVfsConnCB);
+
+	DCL pBuffer		PTR,
+		buffer		BASED pBuffer	(1) BYTE;
+
+	DCL pLength		PTR,
+		length		BASED pLength	WORD;
+
+	DCL error		WORD;
+	DCL fsReqBlk	ReadReqType;
+
+	DCL pReadRespBlk	PTR,
+		readRespBlk		BASED pReadRespBlk	ReadRespType,
+		VipcMessageHeader 
+						BASED pReadRespBlk	VipcMessageHeaderType;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('  RemRead-req/cid/len:'), 22);
+		CALL HexOut (request);
+		CALL HexOut (connID);
+		CALL HexOut (length);
+		CALL NewLine;
+		END;
+$ENDIF
+
+	fsReqBlk.vfsDataLength = length;
+
+	pReadRespBlk = SendRequest (
+						request,
+						sVfsConnCB,
+						SIZE (fsReqBlk),
+						@fsReqBlk,
+						0,
+						0ffffh,
+						0,
+						@Error);
+
+	IF error = 0 THEN
+		DO;
+		length = readRespBlk.vfsDatalength;
+
+			/* divide cnt by 2 so that we can use MOVW */
+		CALL MovW (@ReadRespBlk.buffer, pBuffer, (Length / 2));
+
+			/* Now take care of the left over byte if any */
+		IF length /* and 01h <> 0 */
+			THEN buffer (length-1) = ReadRespBlk.buffer (Length-1);
+
+		CALL VfsFreeResponseBuffer;
+		END;
+
+$	IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('  RemRead Complete-Err/Rcvd len:'), 32);
+		CALL HexOut (error);
+		CALL HexOut (length);
+		CALL NewLine;
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+		END;
+$	ENDIF
+
+	RETURN (error);
+END RemoteRead;
+
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsRead in directory mode
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FsDirRead: PROCEDURE (sVfsConnCB, pUserBuffer, pLength) WORD CLEAN;
+	DCL sVfsConnCB			SELECTOR,
+		vfsConnCB			BASED sVfsConnCB	VfsConnCBType;
+
+	DCL connID				WORD	AT (@sVfsConnCB);
+
+	DCL	pUserBuffer			PTR,
+		userBuffer			BASED pUserBuffer (1) BYTE;
+
+	DCL pLength				PTR,
+		length				BASED pLength WORD;
+
+	DCL error				WORD;
+
+	DCL objectsLeft			WORD,
+		xferAmt				WORD;
+
+	DCL pLocalBuffer		PTR,
+		localBuffer			BASED pLocalBuffer (1) BYTE;
+
+	DCL pDirEntry			PTR,
+		dirEntry			BASED pDirEntry DirectoryEntryType,
+		completeDirEntry	BASED pDirEntry CompleteDirEntryType;
+
+
+$	IF debugging
+	IF FsMaskSet THEN
+		DO;
+			DCL Msg CharStr (cr,lf,'Dir READ-cid/len:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (connID);
+		CALL HexOut (length);
+		CALL NewLine;
+		END;
+$	ENDIF
+
+	objectsLeft = length;
+	length = 0;				/* now accumulate bytes read */
+	error = 0;
+
+	pLocalBuffer = vfsConnCB.pPage;
+
+	IF vfsConnCB.accessType = writeAccess THEN 
+		DO;
+		error = eAccess;
+		GOTO DirReadExit;
+		END;
+
+	DO WHILE (objectsLeft > 0);
+$		IF Debugging
+		IF (vfsConnCB.lenBuffer < vfsConnCB.locBuffer) THEN
+			DO;
+				DCL msg CharStr ('Inconsistent object length in Dir Read',cr,lf);
+			CALL ConLineOut (@msg, size (msg));
+			vfsConnCB.lenBuffer = vfsConnCB.locBuffer;
+			END;
+$		ENDIF
+
+		IF (vfsConnCB.lenBuffer = vfsConnCB.locBuffer) THEN
+			DO;
+				/* For directory reads, we assume that a buffer is provided,  if
+				no buffer is provide then return eNotSupported. */
+			IF vfsConnCB.numBuf = 0 THEN 
+				DO;
+				error = eNotSupport;
+				GOTO DirReadExit;
+				END;
+			ELSE
+				DO;
+					/* get a page of directory objects from remote,
+					there are none left in the local page */
+
+				CALL CLearBuffer (sVfsConnCB);
+				xferAmt = vfsConnCB.DirObjectsPerPage;
+				IF (error := RemoteRead (DOUBLE (ddReadDirPage),
+												sVfsConnCB,
+												pLocalBuffer,
+												@xferAmt))		/* pageSize */
+						<> 0 THEN GOTO DirReadExit;
+				IF (vfsConnCB.lenBuffer := xferAmt) = 0 THEN GOTO DirReadExit;
+				END;
+			END;
+
+
+		IF (vfsConnCB.lenBuffer > vfsConnCB.locBuffer) THEN
+			DO;
+				/* for non-buffered devices, this will compute to 0.
+				There are dir objects in the local buffer, read those first */
+
+			pDirEntry = @localBuffer (vfsConnCB.locBuffer);
+			IF vfsConnCB.objectMode = directoryMode 
+				THEN xferAmt = dirEntry.length + SIZE(dirEntry) - 1;
+				ELSE xferAmt = SIZE(completeDirEntry);
+				
+			CALL MOVB (pDirEntry, @userBuffer, xferAmt);
+$			IF debugging
+			IF (debugMask AND Dbits_Fs) <> 0 THEN
+				DO;
+					DCL msg1 CharStr ('Short Dir Object Read: ');
+					DCL msg2 CharStr ('Long Dir Object Read: ');
+				IF vfsConnCB.objectMode = directoryMode 
+					THEN CALL ConLineOut (@msg1, size (msg1));
+					ELSE CALL ConLineOut (@msg2, size (msg2));
+				CALL ConLineOut (@dirEntry.name, dirEntry.length);
+				CALL NewLine;
+				END;
+$			ENDIF
+
+			vfsConnCB.locBuffer = vfsConnCB.locBUffer + xferAmt;
+			length = length + 1;
+			pUserBuffer = @userBuffer (xferAmt);
+			objectsLeft = objectsLeft - 1;
+			END;
+			
+		END; /* outer while */
+
+	DirReadExit: 
+
+$	IF debugging
+	IF FsMaskSet THEN
+		DO;
+			DCL msg CHarStr ('Dir Read Complete-Err/Rcvd len:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (error);
+		CALL HexOut (length);
+		CALL NewLine;
+		
+		IF SingleStepMaskSet THEN CALL PrintTimings;
+		END;
+$	ENDIF
+
+	RETURN (error);
+
+END FsDirRead;
+
+$IF pipelinedRead
+$INCLUDE (Vfs2.pipelinedRead.Inc~Text~)
+$ELSEIF longRead
+$INCLUDE (Vfs2.longRead.Inc~Text~)
+$ELSE
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsRead
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FsRead: PROCEDURE (sVfsConnCB, pUserBuffer, pLength) WORD CLEAN;
+	DCL sVfsConnCB	SELECTOR,
+		vfsConnCB	BASED sVfsConnCB	VfsConnCBType;
+
+	DCL connID		WORD	AT (@sVfsConnCB);
+
+	DCL	pUserBuffer	PTR,
+		userBuffer	BASED pUserBuffer (1) BYTE;
+
+	DCL pLength		PTR,
+		length		BASED pLength WORD;
+
+	DCL error		WORD;
+
+	DCL bytesLeft		WORD,
+		xferAmt			WORD,
+		bytesReceived	WORD,
+		localBytes		WORD;
+
+	DCL pLocalBuffer	PTR,
+		localBuffer		BASED pLocalBuffer (1) BYTE;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@(cr,lf,'READ-cid/len:'), 15);
+		CALL HexOut (connID);
+		CALL HexOut (length);
+		CALL NewLine;
+		END;
+$ENDIF
+
+	bytesLeft = length;
+	length = 0;				/* now accumulate bytes read */
+	error = 0;
+
+	pLocalBuffer = vfsConnCB.pPage;
+
+	IF vfsConnCB.accessType = writeAccess THEN 
+		DO;
+		error = eAccess;
+		GOTO ReadExit;
+		END;
+
+		DO WHILE (bytesLeft > 0);
+			localBytes = vfsConnCB.lenBuffer - vfsConnCB.locBuffer;
+			/* for non-buffered devices, this will compute to 0 */
+
+			IF localBytes > 0 THEN
+				DO;
+					/* There is data in the local buffer, read that first */
+					xferAmt = WMIN (localBytes, bytesLeft);
+
+					CALL MOVW (@localBuffer (vfsConnCB.locBuffer),
+									@userBuffer,
+								SHR (xferAmt, 1));
+
+					IF xferAmt /* AND 01h <> 0 */ THEN
+						DO;  /* move the odd byte */
+							userBuffer (xferAmt-1)
+								= localBuffer (vfsConnCB.locBuffer + xferAmt - 1);
+						END;
+
+					vfsConnCB.locBuffer = vfsConnCB.locBuffer + xferAmt;
+					length = length + xferAmt;
+
+					IF (bytesLeft := bytesLeft - xferAmt) = 0 THEN GOTO ReadExit;
+					pUserBuffer = @userBuffer (xferAmt);
+				END;
+
+			/* A good place to check for end of file condition. */
+
+			IF (vfsConnCB.pageRead AND (vfsConnCB.lenBuffer < pageSize))
+				THEN GOTO ReadExit;
+
+			/* All data from local buffer (if any) is transferred,  Now
+			flush local buffer (if any) and then if bytesleft is > pageSize
+			then do direct reads into user's buffer.  For non buffered
+			devices, do direct read for rest of the data. */
+
+			IF (error := LocalFlush (sVfsConnCB)) <> 0 THEN GOTO ReadExit;
+
+			DO WHILE (bytesLeft > pageSize)
+/*				OR ((NOT vfsConnCB.deviceType) AND (bytesLeft > 0)) */
+				;
+					xferAmt = WMIN (pageSize, bytesLeft);
+
+					IF (error := RemoteRead (DOUBLE (ddRead),
+												sVfsConnCB,
+												@userBuffer,
+												@xferAmt))
+						<> 0 THEN GOTO ReadExit;
+
+					length = length + xferAmt;
+
+					IF xferAmt < pageSize THEN GOTO ReadExit;
+					/* it was either end of file, or the last block
+					for a non-buffered device */
+
+					bytesLeft = bytesLeft - xferAmt;
+					pUserBuffer = @UserBuffer(xferAmt);
+
+				END; /* inner while */
+
+			/* NOW 0 <= bytesLeft < pageSize.  It will get here with bytesLeft
+			> 0 only for buffered devices, read a page */
+
+			IF bytesLeft > 0 THEN
+				DO;
+					xferAmt = pageSize;
+					IF (error := RemoteRead (DOUBLE (ddRead),
+												sVfsConnCB,
+												pLocalBuffer,
+												@xferAmt))		/* pageSize */
+						<> 0 THEN GOTO ReadExit;
+					vfsConnCB.lenBuffer = xferAmt;
+					vfsConnCB.pageRead = TRUE;
+
+					/* bytes from the local buffer will now be transferred to
+					user buffer at the top of the outer while loop */
+				END;
+
+		END; /* outer while */
+
+	readExit: 
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+			CALL ConLineOut (@('Read Complete-Err/Rcvd len:'), 27);
+			CALL HexOut (error);
+			CALL HexOut (length);
+			CALL NewLine;
+		END;
+$ENDIF
+
+	RETURN (error);
+
+END FsRead;
+$ENDIF
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Remote Write
+&	called for OsWrite, OsWriteDescriptor, OsGetStatus
+&	from FsWrite and EntryPoint.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+RemoteWrite: PROCEDURE (request, sVfsConnCB, pBuffer, length) WORD CLEAN;
+	DCL request		WORD;
+	DCL sVfsConnCB	SELECTOR;
+
+	DCL connID		WORD	AT (@sVfsConnCB);
+
+	DCL pBuffer		PTR,
+		buffer		BASED pBuffer	(1) BYTE;
+
+	DCL length		WORD;
+
+	DCL error		WORD;
+	DCL fsReqBlk	ReadReqType;
+
+	DCL pFsRespBlk	PTR,
+		fsRespBlk	BASED pFsRespBlk	SimpleRespType;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('  RemWrite-req/cid/len:'), 23);
+		CALL HexOut (request);
+		CALL HexOut (connID);
+		CALL HexOut (length);
+		CALL NewLine;
+		END;
+$ENDIF
+
+	IF length > pageSize THEN RETURN (eParam);
+	fsReqBlk.vfsDataLength = length;
+	pFsRespBlk = SendRequest (
+						request,
+						sVfsConnCB,
+						SIZE (fsReqBlk),
+						@fsReqBlk,
+						Length,
+						pBuffer,
+						SIZE (fsRespBlk),
+						@Error);
+
+	IF error = 0 THEN CALL VfsFreeResponseBuffer;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('  RemWrite Complete',cr,lf), 21);
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+		END;
+$ENDIF
+
+	RETURN (error);
+END RemoteWrite;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					FsWrite
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FsWrite: PROCEDURE (sVfsConnCB, pUserBuffer, bytesLeft) WORD CLEAN;
+	DCL sVfsConnCB		SELECTOR,
+		vfsConnCB		BASED sVfsConnCB	VfsConnCBType;
+
+	DCL connID		WORD	AT (@sVfsConnCB);
+
+	DCL	pUserBuffer		PTR,
+		userBuffer		BASED pUserBuffer (1) BYTE;
+
+	DCL bytesLeft		WORD;
+
+	DCL error			WORD;
+	DCL secondTime		BOOLEAN;
+	DCL spaceLeft		WORD;
+	DCL	xferAmt			WORD;
+
+	DCL pLocalBuffer	PTR,
+		localBuffer		BASED pLocalBuffer (1) BYTE;
+
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		DCL (i, cnt) BYTE;
+		CALL ConLineOut (@(cr,lf,'WRITE-cid/len:'), 16);
+		CALL HexOut (connID);
+		CALL HexOut (bytesLeft);
+		CALL NewLine;
+
+		/* print first 10 bytes of data */
+		IF bytesLeft > 9 THEN cnt = 9;
+		ELSE cnt = bytesLeft-1;
+		DO i = 0 TO cnt;
+			CALL HexByteOUt (userBuffer(i));
+			END;
+		CALL ConLineOUt (@('    *'),5);
+		DO i = 0 TO cnt;
+			IF (UserBuffer(i) >= 20h) AND (userBuffer(i) <= 7fh) THEN
+				CALL ConCharOUt (UserBuffer(i));
+			ELSE CALL ConCharOUt ('.');
+			END;
+		CALL ConLineOut (@('*',cr,lf),3);
+		END;
+$ENDIF
+
+	pLocalBuffer = vfsConnCB.pPage;
+	IF (vfsConnCB.accessType = readAccess) 
+    	OR (vfsConnCB.objectMode <> byteMode) THEN 
+		DO;
+		error = eAccess;
+		GOTO WriteExit;
+		END;
+
+	secondTime = FALSE;
+	error = 0;	/* for the trivial case of bytesLeft = 0 */
+
+	DO WHILE (bytesLeft > 0);
+			IF vfsConnCB.pageRead THEN 
+				DO;
+				IF (error := LocalFlush (sVfsConnCB)) <> 0 THEN GOTO WriteExit;
+				END;
+
+			/* Write small amounts to local buffer.  If local buffer is 
+			partially full then fill it up first and then send it to remote */
+
+			IF secondTime OR (vfsConnCB.locBuffer > 0) THEN
+				DO;
+					/* It has come here because the local buffer is at least
+					partially filled or second time to write the last remaining
+					bytes after direct page writes */
+
+					spaceLeft = pageSize - vfsConnCB.locBuffer;
+					xferAmt = WMin (bytesLeft, spaceLeft);
+
+					CALL MOVW (pUserBuffer,
+									@localBuffer (vfsConnCB.locBuffer),
+								SHR (xferAmt, 1));
+
+					IF xferAmt /* AND 01h <> 0 */ THEN
+						DO;  /* move the odd byte */
+							localBuffer (vfsConnCB.locBuffer + xferAmt - 1)
+							= userBuffer (xferAmt-1);
+						END;
+
+					vfsConnCB.locBuffer = vfsConnCB.locBuffer + xferAmt;
+					vfsConnCB.pageDirty = TRUE;
+
+					IF vfsConnCB.locBuffer > vfsConnCB.lenBuffer THEN
+						vfsConnCB.lenBuffer = vfsConnCB.locBuffer;
+
+					IF (bytesLeft := bytesLeft - xferAmt) = 0 THEN GOTO WriteExit;
+					pUserBuffer = @UserBuffer (xferAmt);
+				END;
+
+			/* there are more bytes left to be writtern.  If more than page
+			size, then write directly to remote.  If non buffered then write
+			directly anyway */
+
+			IF (error := LocalFlush (sVfsConnCB)) <> 0 THEN GOTO writeExit;
+
+			DO WHILE (bytesLeft > pageSize)
+/*				OR ((NOT vfsConnCB.deviceType) AND bytesLeft > 0) */
+					;
+
+					xferAmt = WMin (bytesLeft, pageSize);
+					IF (error := RemoteWrite (DOUBLE (ddWrite),
+											sVfsConnCB,
+											pUserBuffer,
+											xferAmt))
+						<> 0 THEN GOTO WriteExit;
+
+					bytesLeft = bytesLeft - xferAmt;
+					pUserBuffer = @UserBuffer (xferAmt);
+
+				END;	/* inner while */
+
+			/* for buffered devices 0 <= bytesLeft < pageSize, make secondtime
+			true so that local write will take care of it */
+
+			secondTime = TRUE;
+
+		END;	/* outer while */
+
+WriteExit:
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN 
+		DO;
+		CALL ConLineOut (@('Write Complete:'), 15);
+		CALL HexOut (error);
+		CALL Newline;
+		END;
+$ENDIF
+
+  RETURN (error);
+END FsWrite;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Remote Seek
+&	called by FsSeek, SeekForFlush, & LocalFlush.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+RemoteSeek: PROCEDURE (sVfsConnCB, mode, position) WORD CLEAN;
+	DCL sVfsConnCB	SELECTOR;
+	DCL connID		WORD	AT (@sVfsConnCB);
+
+	DCL mode		BYTE;
+	DCL position	DWORD;
+
+	DCL	error		WORD;
+	DCL fsReqBlk	SeekReqType;
+
+	DCL pFsRespBlk	PTR,
+		fsRespBlk	BASED pFsRespBlk	SimpleRespType;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('  Remote Seek-cid/md/pos:'), 25);
+		CALL HexOut (connID);
+		CALL HexByteOut (mode);
+		CALL HexOut (HIGH (position));
+		CALL ConHexOut (LOW (position));
+		CALL NewLine;
+		END;
+$ENDIF
+
+	fsReqBlk.mode = mode;
+	fsReqBlk.position = position;
+	pFsRespBlk = SendRequest (
+						DOUBLE (ddSeek),
+						sVfsConnCB,
+						SIZE (fsReqBlk),
+						@fsReqBlk,
+						0,
+						0ffffh,
+						SIZE (fsRespBlk),
+						@Error);
+
+	IF error = 0 THEN CALL VfsFreeResponseBuffer;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('  RemSeek Complete',cr,lf), 20);
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+		END;
+$ENDIF
+
+	RETURN (error);
+END RemoteSeek; /* RemoteSeek */
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Remote Copy
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FsRemoteCopy: PROCEDURE (sVfsConnCB, pBuffer) WORD CLEAN;
+	DCL sVfsConnCB			SELECTOR;
+
+	DCL pBuffer				PTR,
+	 	secondConnID		BASED pBuffer SELECTOR;
+
+	DCL sSecondVfsConnCB	SELECTOR,
+		secondVfsConnCB		BASED sSecondVfsConnCB	VfsConnCBType;
+
+	sSecondVfsConnCB = secondConnID;
+	RETURN  (RemoteWrite (DOUBLE (ddRemoteCopy),
+						  	sVfsConnCB,
+							@secondVfsConnCB.serversConnID,
+							2)
+			);
+END FsRemoteCopy;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	WaitForVfsResponse:
+&	waits for response for about timeInSeconds specified, if Vipc is alive.
+&	If Vipc dies in the mean time, it returns with reason for Vipc's death.
+&	It checks Vipc's health every second.
+&
+&	Called by SendRequest and FsRead (pipelined)
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+WaitForVfsResponse: PROCEDURE (semID, vipcConnID) WORD REENTRANT;
+DCL semID			WORD;
+DCL secondsWaited 	WORD;
+DCL (note, error) 	WORD;
+DCL vipcConnID		WORD;
+
+	secondsWaited = 0;
+	DO WHILE TRUE;
+		note = OsWait (semId, 1000, @Error);
+
+		IF error <> eTimeOut THEN RETURN (error);
+
+		IF (secondsWaited := secondsWaited + 1) > VfsResponseTimeout
+		   	THEN RETURN (eTimeOut);;
+
+		IF (error := HowIsVipc (vipcConnID)) <> eOK THEN RETURN (error);
+		END;
+END WaitForVfsResponse;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	Send Request:
+&
+&	All the fs routines call this routine to send a request to remote VFS
+&	manager.  This routines fills in the header for the common VFS fields.
+&	All fs routines will have already provided space for the Vipc Header 
+&	fields (for vipc message type).  To send the message this routine calls 
+&	VipcInternalSend which will fill in the vipc fields and send the message.
+&
+&	For a response from VFS manager, it waits on the responseReceived 
+&	semaphore defined in the vfsConnCB for the vfs connection for the 
+&	current vfs request.  When vipc gets a response for vfs it calls
+&	VfsResponseArrived.  That routine will set the shared variable 
+&	pVipcResponse to point to the Vipc header and pVfsResponse to point
+&	to the Vfs Header in the response, and signal the responseReceived 
+&	semaphore.
+&
+&	If there is no error then the calling procedure must release the receive 
+&	buffer by calling DlFreeReceiveBuffer.
+&	
+&	This works because there is only one receive buffer.  If we go to 
+&	multiple receive buffer, then smarter queues will have to be implemented.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+SendRequest: PROCEDURE (request, 
+				sVfsConnCB,			/* local Conn ID, also selector to CCB */
+				vfsVipcReqHdrLen,	/* length of vfs request header */
+				pVfsVipcReqHdr,		/* pointer to request block */
+				Buflen,				/* length of buffer - 0 if none */
+				pBuf,				/* pointer to buf - ignored if buflen is 0 */
+				expectedRespLen,	/* expected length of response - 0 if request
+									is ddRead or ddGetStatus, because response
+									length is not known, use length field of
+									response for error checking */
+				pError				/* pointer to error */
+					) PTR CLEAN;
+
+
+	DCL request				WORD,
+		sVfsConnCB			SELECTOR,
+		vfsVipcReqHdrLen	WORD,
+		pVfsVipcReqHdr		PTR,
+		bufLen					WORD,
+		pBuf				PTR,
+		expectedRespLen		WORD,
+		pError				PTR;
+
+	DCL error				BASED pError			WORD;
+	DCL vfsVipcReqHdr		BASED pVfsVipcReqHdr	SimpleReqType;
+	DCL vfsConnCB			BASED sVfsConnCB		VfsConnCBType;
+
+	DCL vfsSimpleResp		BASED pVfsResponse		SimpleRespType;
+	DCL vfsReadResp			BASED pVfsResponse		ReadRespType;
+
+$IF serverVfs
+	DCL vipcHeader			BASED pVipcResponse		VipcIfMsgType;
+$ELSE
+	DCL vipcHeader			BASED pVipcResponse		VipcMsgType;
+$ENDIF
+
+	DCL twitchState			DWORD;
+
+	/* set the common vfs header fields */
+
+	vfsVipcReqHdr.vfsRequest = request;
+	vfsVipcReqHdr.requestorsConnID = sVfsConnCB;
+	vfsVipcReqHdr.serversConnID = vfsConnCB.serversConnID;
+	vfsVipcReqHdr.class = VfsClass;
+	vfsVipcReqHdr.note = (vfsConnCB.seqNumber := vfsConnCB.seqNumber+1);
+		
+$IF debugging
+	IF (debugMask AND Dbits_DetailedFs) <> 0 THEN
+		DO;
+			DCL w WORD,
+				sW SELECTOR AT (@w);
+			DCL msg CharStr ('Sending req/lCID/rCID:');
+			CALL COnLineOut (@msg, size(msg));
+			CALL HexOut (request);
+			sW = vfsVipcReqHdr.requestorsConnID;
+			CALL HexOUt (w);
+			CALL HexOUt (vfsVipcReqHdr.serversConnID);
+			CALL NewLine;
+		END;
+	IF (debugMask AND Dbits_timing) <> 0 THEN CALL SetStartTime;
+$ENDIF
+
+	/* send it to VFS manager on remote server, VipcInternalSend will set the
+	Vipc Header part of vfVipcReqHdr */
+
+	twitchState = TurnTwitchOn;
+	CALL VipcDisableActivityTimeOut;
+
+	vfsConnCB.respExpected = TRUE;
+	error = VipcInternalSend (
+					vfsConnCB.vipcConnID,	/* IPC pathID usd fr this vfs conn */
+					vfsVipcReqHdrLen,		/* vfs & vipc hdr space */
+					pVfsVipcReqHdr,			/*			"			*/
+					bufLen,					/* vfs data */
+					pBuf);					/*		"	*/
+
+	IF error = 0 THEN
+		DO;
+		DO WHILE TRUE;
+			error = WaitForVfsResponse (vfsConnCB.RespReceived,
+							 vfsConnCB.vipcConnID);
+
+			IF error = 0 THEN
+				DO;
+				/* check the response type, it must be same as the
+				request with the high order bit set */
+
+				IF vfsSimpleResp.vfsResponse <> (request OR 8000h) THEN 
+                	DO;
+$					IF Debugging
+						DCL msg CHarStr ('Rcvd Bad response type, req/resp:');
+					  	CALL ConLineOUt (@msg, size(msg));
+						CALL HExOUt (request);
+						CALL HexOUt (vfsSimpleResp.vfsResponse);
+						CALL newline;
+$					ENDIF
+					error = eVfsBadResponseType;
+					END;
+
+				ELSE IF vipcHeader.note <> VfsConnCB.seqNumber THEN
+					DO;
+$					IF Debugging
+					DCL msg CharStr ('### Rcvd Out Of Seq Fs Response ###:');
+					CALL ConLineOUt (@msg, size (msg));
+					CALL HexOut (vipcHeader.note);
+					CALL newline;
+$					ENDIF
+					error = eOutOfSeqVfsResp;
+					END;
+
+				ELSE error = vfsSimpleResp.error;
+
+				IF error <> 0 THEN CALL VfsFreeResponseBuffer;
+
+				IF error = eVfsIsStillDoingIt THEN 
+					DO;
+					CALL TurnTwitchOff (twitchState);
+					twitchState = TurnTwitchOn;
+					END;
+
+				ELSE 
+					DO;
+$					IF Debugging
+					IF (error <> 0) AND detailedFsMaskSet THEN 
+						DO;
+						DCL msg CharStr ('VFS response error:');
+						CALL ConLineOut (@msg, size(msg));
+						CALL HexOut (error);
+						CALL newline;
+						END;
+$					ENDIF
+					GOTO LoopExit;
+					END;
+				END;
+
+			ELSE
+				DO;
+$				IF Debugging
+				DCL msg CharStr ('Error in Waiting for VfsResponse:');
+				CALL ConLineOut (@msg, size(msg));
+				CALL HexOut (error);
+				CALL newline;
+$				ENDIF
+				GOTO LoopExit;
+				END;
+		END;	/* do while true */
+
+loopExit:
+
+		vfsConnCB.respExpected = FALSE;
+		IF error = eTimeOut THEN CALL ClearSignal (vfsConnCB.RespReceived);
+
+$IF debugging
+		IF error = 0 THEN
+			DO;
+			IF (debugMask AND Dbits_DetailedFs) <> 0 THEN
+				DO;
+				DCL w WORD, sw SELECTOR AT (@w);
+
+				CALL ConLineOut (@('Rcvd resp/lCID/rCID:'), 20);
+				CALL HexOUt (vfsSimpleResp.vfsResponse);
+				sW = vfsSimpleResp.requestorsConnID;
+				CALL HexOUt (w);
+				CALL HexOUt (vfsSimpleResp.serversConnID);
+				CALL NewLine;
+				END;
+			END;
+
+		IF (debugMask AND Dbits_timing) <> 0 THEN CALL SetStopTime;
+$ENDIF
+
+		END;
+
+$IF Debugging
+	ELSE 
+		DO;
+		DCL msg CharStr ('Error in Internal Send:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (error);
+		CALL newline;
+		END;
+$ENDIF
+
+	CALL TurnTwitchOff (twitchState);
+	/* No request outstanding, enable activity timeout */
+	CALL VipcEnableActivityTimeOut;
+$	IF Debugging
+	IF (DebugMask AND Dbits_Fs) <> 0 THEN 
+		DO;
+		IF (error <> 0) AND (error <> 33) THEN 
+			DO;
+			DCL msg CharStr ('Error in Vfs Response, err:');
+			CALL conlineOUt (@msg, size (msg));
+			CALL HexOUt (error);
+			CALL newline;
+			END;
+		END;
+$	ENDIF
+	RETURN (pVfsResponse);
+
+END SendRequest; /* SendRequest */
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	VfsResponseArrived:
+&
+&	This routine is called by Vipc when it receives a message from remote 
+&	and it belongs to VFS.  This routine finds out the vfsConnID to which
+&	it belong and signals the responseReceived semahpore defined in the 
+&	respective vfs connection Control Block.  The requesting process is 
+&	waiting on this semaphore.  Before signalling, it sets the shared
+&	variable pVipcResponse & pVfsResponse.   
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VfsResponseArrived: PROCEDURE (pResponse) PUBLIC;
+	DCL pResponse			PTR;
+
+	DCL vfsSimpleResp		BASED pVfsResponse	SimpleRespType;
+
+	DCL sVfsConnCB			SELECTOR,
+		vfsConnCB			BASED sVfsConnCB	VfsConnCBType;
+
+	DCL error				WORD;
+	DCL note				WORD;
+
+$IF serverVfs
+	DCL vipcResponse		BASED pResponse		vipcIfMsgType;
+	note = OsWait (VfsResponseLock, NULLWORD, @error);
+	pVfsResponse = @vipcResponse.dataArea;
+$ELSE
+	DCL vipcResponse		BASED pResponse		vipcMsgType;
+	pVfsResponse = @vipcResponse.vipcData;
+$ENDIF
+
+	pVipcResponse = pResponse;
+
+	sVfsConnCB = vfsSimpleResp.requestorsConnID;
+	IF vfsConnCB.respExpected THEN
+		DO;
+		CALL OsSignal (
+				vfsConnCB.RespReceived,
+				signalNormal OR 80h,	/* this rtn may be called from an ISR */
+				0,						/* note */
+				@error);
+	
+		IF error <> 0 THEN CALL VfsFreeResponseBuffer;
+		END;
+	ELSE 
+		DO;
+$IF Debugging
+		DCL msg1 CharStr('Received Unexpected Vfs Response - thrown away.',cr,lf);
+		DCL msg2 CharStr('resp/cid/error:');
+		DCL vfsConnID WORD	AT (@sVfsConnCB);
+
+		CALL ConLineOut (@msg1, size(msg1));
+		CALL ConLineOut (@msg2, size(msg2));
+		CALL HexOut (vfsSimpleResp.vfsResponse);
+		CALL HexOut (VfsConnID);
+		CALL HexOut (vfsSimpleResp.error);
+		CALL newline;
+$ENDIF
+		CALL VfsFreeResponseBuffer;
+		END;
+
+END VfsResponseArrived; 
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsFreeResponseBuffer
+&		free the response buffer and signal responseLock so that next
+&		response can proceed.  Some of Vfs code cannot deal with multiple
+&		responses simultaneously.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VfsFreeResponseBuffer: PROCEDURE CLEAN;
+DCL error WORD;
+DCL vipcResponse	BASED pVipcResponse		VipcIfMsgtype;
+
+$IF serverVfs
+	IF vipcResponse.tobeFreed THEN CALL OsFree (pVipcResponse, @error);	
+	CALL OsSignal (VfsResponseLock, signalNormal, 0, @error);
+$ELSE
+	CALL VipcFreeReceiveBuffer;
+$ENDIF
+END VfsFreeResponseBuffer;
+
+
+END Vfs2;	/* end of module */

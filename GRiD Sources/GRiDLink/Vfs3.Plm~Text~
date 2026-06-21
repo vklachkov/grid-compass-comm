@@ -1,0 +1,723 @@
+$TITLE ('Virtual File System Calls - Part 3')
+$COMPACT (EXPORTS VfsProcess)
+$OPTIMIZE(3) SET(VFS3) 
+
+VFS3: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	This is VFS3.  
+&
+&	PROCEDURES:
+&		All the server code assumes single IPC connection to VfsManager
+&
+&		Called from EntryPoint:
+&
+&			VfsInitialize
+&			VfsTerminate
+&			VfsSignon
+&			VfsSignOff
+&			FsChangeUserContext
+&
+&		Called from Vfs1/2:
+&
+&			GetVipcConnID
+&			GiveUpVipcConnID
+&			VipcInternalSend
+&
+&		Called from Vipc2:
+&
+&			VfsResetVipcConnForDevice
+&
+&		NOOPS for server Vfs
+&
+&	Author:	Rajendra Shah
+&	Start Date:	12/13/82
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	some history:
+&
+&	In the old scheme multiple VIPC connections were used to send file
+&	system request.  A VIPC connection was used for every logical device in
+&	the ADT.  For device not in the ADT, a new Vipc connection was used
+&	for every file attached on that device.
+&
+&	In the new scheme only one VIPC conn is maintained between Vfs and 
+&	Vfs~manager~ and all file system requests are sent on that connection.  
+&	The old code is removed.  Look at archive if necessary.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+$EJECT
+$SAVE NOLIST
+$INCLUDE (``Incs`Plm.Inc~Text~)
+ 
+	/* Os Constants, Types and Externals */
+	
+$INCLUDE (``OsIncs`Os.Constant.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Error.Inc~Text~)
+$INCLUDE (``Incs`Errors.plm.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Device.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+ 
+	/* constants and types */
+	
+$INCLUDE (VfsVipc.Constant.Inc~Text~)
+$INCLUDE (VfsVipcConnCB.Type.Inc~Text~)
+$INCLUDE (VfsVipc.Type.Inc~Text~)
+ 
+	/* Externals */
+	
+$IF serverVfs OR PostOffice
+$INCLUDE (Vfs.Ext.Inc~Text~)
+$ENDIF
+
+$IF NOT serverVfs
+$INCLUDE (Vipc.Ext.Inc~Text~)
+$INCLUDE (Dlc.Ext.Inc~Text~)
+$ENDIF
+ 
+/* This is from Cp.MemMgr.Ext.Inc */
+
+/*IntAllocate: PROCEDURE (pid, length, pError) PTR EXTERNAL;
+	DCL pid		PidType;
+	DCL length	WORD;
+	DCL pError	PTR;
+	END;*/
+	
+$IF Debugging
+$INCLUDE (Debug.Inc~Text~)
+ 
+DCL	debugMask	WORD	EXTERNAL;
+$ENDIF
+$RESTORE
+ 
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	LOCAL & PUBLIC VARIABLES
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL filesAttached 	WORD PUBLIC INITIAL (0);
+
+$IF serverVfs OR PostOffice
+DCL sVfsLayerConnCB 	SELECTOR PUBLIC INITIAL (NULLWORD);
+DCL	VfsLayerConnCB		BASED sVfsLayerConnCB VfsConnCBType;
+$ENDIF
+
+$IF serverVfs
+DCL VfsResponseLock	WORD PUBLIC;
+DCL UserInfoPtr		PTR;
+DCL UserInfoLength	WORD;
+
+DCL VfsProcessID	WORD;
+DCL SignonSignal	WORD;
+DCL connectComplete	WORD;
+$ENDIF
+
+$IF PostOffice
+DCL AutoSignOnDisabled BOOLEAN INITIAL (FALSE);
+$ENDIF
+DCL VfsmanagerPathName 	FileNameType;
+	/* The name is not expected to exceed 80 bytes */
+
+DCL VfsManagerConn		WORD INITIAL (0);
+DCL VfsManagerStr 		CharStr ('Vfs~Manager~');
+
+$EJ
+$IF serverVfs
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DUMMY CALLS FOR SERVER VFS
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+HowIsVipc: PROCEDURE (vipcConnID) WORD CLEAN; 
+	DCL vipcConnID 	WORD;
+	RETURN (0);
+END HowIsVipc;
+
+VipcEnableActivityTimeOut: PROCEDURE CLEAN; 
+	;
+	END;
+
+VipcDisableActivityTimeOut: PROCEDURE CLEAN;
+	;
+	END;
+
+TurnTwitchOn: PROCEDURE DWORD CLEAN; 
+	RETURN (0);
+	END;
+
+TurnTwitchOff: PROCEDURE (twitchState) CLEAN; 
+	DCL	twitchState	DWORD;
+	;
+	END;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcInternalSend:  used by Vfs
+&
+&	when called by VipcSend header is the VipcHeader.  Whenc called by vfs
+&	the header is vipc + vfs header.
+&
+&	This routine fills in the following vipc header fields:
+&
+&		functionCode, localPathID, remotePathID, vipcDataDength.  
+&
+&	Rest of the fields must be filled in by the caller.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcInternalSend: PROCEDURE (vipcConnID, headerLen, pHeader, bufferLen,
+		 pBuffer) WORD CLEAN;
+
+	DCL vipcConnID			WORD,
+		sVipcConnCB			SELECTOR AT (@vipcConnID),
+		vipcConnCB			BASED sVipcConnCB			VipcConnCBType;
+
+	DCL headerLen			WORD, 
+		bufferLen			WORD;
+	DCL pHeader				PTR,
+		pBuffer				PTR;
+
+	DCL vipcProtocolHeader	BASED pHeader VipcMessageHeaderType;
+	DCL vfsVipcHeader		BASED pHeader (1) BYTE;
+	DCL vfsHeaderLen		BYTE;
+
+	DCL error				WORD;
+
+	DCL pReqBuffer			PTR,
+		reqBuffer			BASED pReqBuffer VipcIfMsgType;
+
+	DCL vipcMessageHeader	Based pHeader VipcMessageHeaderType;
+
+	vfsHeaderLen = headerLen - SIZE (vipcProtocolHeader);
+	pReqBuffer = OsAllocate (vfsHeaderLen + bufferLen + ipcHeaderLength,
+								  @error);
+	CALL SETW (0, @reqBuffer.reserved, 2);
+	reqBuffer.VipcFunctionCode = VIPC_Ix_Msg;
+	reqBuffer.toBeFreed = TRUE;
+	reqBuffer.VipcDatalength = vfsHeaderLen + bufferLen; 
+	
+	CALL MOVB (@vfsVipcHeader (SIZE(vipcProtocolHeader)), 
+					 @reqBuffer.dataArea, 
+					 vfsHeaderLen);
+	CALL MOVB (pBuffer,  @reqBuffer.dataArea (vfsHeaderLen), bufferLen);
+
+$IF olddebug
+	DO;
+	DCL msg CharStr ('Sending Vfs Request:',cr,lf);
+	DCL i WORD;
+	DCL msgBuffer BASED pReqBuffer (1) BYTE;
+	CALL ConLineOut (@msg, size (msg));
+	DO i = 0 TO headerLen;
+		CALL HexByteOut (msgBuffer (i));
+		END;
+	CALL newline;
+	END;
+$ENDIF
+
+	CALL OsSend (vfsManagerConn, vipcMessageHeader.class, 
+				vipcMessageHeader.note, pReqBuffer, @error);
+
+$IF Debugging
+	IF VipcMsgMaskSet THEN 
+		DO;
+		IF error = 0 THEN
+			DO;
+			DCL msg CharStr ('    Msg Sent, CID/cl/nt/ln: ');
+			CALL ConLineOut (@msg, size(msg));
+			CALL HexOut (vipcConnID);
+			CALL HexOut (reqBuffer.class);
+			CALL HexOut (reqBuffer.note);
+			CALL HexOut (reqBuffer.vipcDataLength);
+			CALL NewLine;
+			END;
+		ELSE
+			DO;
+			DCL msg CharStr ('    Os Send Error:');
+			CALL ConLineOut (@msg, size(msg));
+			CALL Hexout (error);
+			CALL newline;
+			END;
+		END;
+$ENDIF
+
+	RETURN (error);
+END VipcInternalSend;
+$ENDIF
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&			VfsSignON
+&	Do VipcSignon.  If succesful then create `<servername>:vfs~manager~.  
+&	This pathname will be used by getvipcConnID to connect to Vfs~Manager~.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VfsSignON: PROCEDURE (plength, pUserInfo, pDataLinkInfo) WORD CLEAN;
+	DCL	pLength				PTR,
+		length				BASED pLength	WORD;
+
+	DCL	pUserInfo			PTR,
+		pDataLinkInfo		PTR;
+
+	DCL	error				WORD;
+	DCl serverNameStr		BASED pUserInfo PathNameType;
+	DCL serverNameLength	BYTE;
+
+$IF serverVFS
+	DCL note				WORD;
+
+	UserInfoPtr = pUserInfo;
+	userInfoLength = length;
+	CALL OsSignal (SignonSignal, SignalNormal, 0 , @error);
+	error = OsWait (ConnectComplete, NULLWORD, @error);
+	length = serverNameStr.length;
+$ELSE
+
+	error = VipcSignON (plength, pUserInfo, pDataLinkInfo);
+
+	IF error = 0 THEN
+		DO;
+		ServerNameLength = serverNameStr.length;
+		VfsManagerPathName.length = ServerNameLength + 2 
+									+ size(VfsManagerStr);
+		VfsManagerPathName.chars(0) = '`';
+		CALL MOVB  (@serverNameStr.chars,
+					@VfsManagerPathName.chars(1),
+					ServerNameLength);
+		VfsManagerPathName.chars (ServerNameLength + 1) = ':';
+		CALL MOVB  (@VfsManagerStr,
+					@VfsManagerPathName.chars(ServerNameLength + 2),
+					size(VfsManagerStr));
+$IF Debugging
+		IF (DebugMask AND Dbits_MajorEvents) <> 0 THEN 
+			DO;
+			DCL msg CharStr ('Vfs Manager Path Name:');
+			CALL ConLineOut (@msg, size (msg));
+			CALL ConLineOut (@VfsManagerPathName.chars, 
+				VfsManagerPathName.length);
+			CALL newline;
+			END;
+$ENDIF
+		END;
+$ENDIF
+
+	RETURN (error);
+END VfsSignon;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsSignOFF
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VfsSignOFF: PROCEDURE WORD CLEAN;
+	DCL error			WORD;
+
+	/* zzz must do a VipcDisconnect of VFS's IPC connection */
+$IF serverVfs
+	RETURN (eNotSupport);
+$ELSE
+
+	IF filesAttached > 0 THEN 
+		DO;
+$IF Debugging
+		IF MajorEventsMaskSet THEN
+			DO;
+			DCL msg Charstr ('Cannot signoff, # of files attached: ');
+			CALL ConLIneout (@msg, size(msg));
+			CALL ConHexOut (filesAttached);
+			CALL Newline;
+			END;
+$ENDIF
+		error = eCannotSignoff;
+		END;
+
+	ELSE error = VipcSignoff;
+
+	RETURN (error);
+$ENDIF
+END VfsSignOff;
+
+
+$EJECT
+$IF serverVfs OR PostOffice
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	FsChangeUserContext
+&	After a change user context an auto sign-on can cause wrong result
+&	since the server side will use the context of the original signon user.
+&	Hence disable auto-signon on a change user context if the buffer length
+&	is non zero and enable it if it is zero (implying back to the original)
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FsChangeUserContext: PROCEDURE (pBuffer, length) WORD CLEAN;
+DCL pBuffer 	PTR;
+DCL length		WORD;
+DCL error		WORD;
+
+$	IF PostOffice
+	IF length = 0 THEN AutoSignonDisabled = FALSE;
+	ELSE AutoSignonDisabled = TRUE;
+$	ENDIF
+	vfsLayerConnCB.vipcConnID = GetVipcConnID (@error);
+	IF error = 0 THEN 
+		DO;
+		error = RemoteWrite (ddChangeUserContext, sVfsLayerConnCB,
+								 			pBuffer, length);
+		CALL GiveUpVipcConn (vfsLayerConnCB.vipcConnID);
+		END;
+	RETURN (error);
+END FsChangeUserContext;
+$ENDIF
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	GetVipcConnID
+&	This routine is called to get the vipcConnID to be used for sending 
+&	requests to Vfs~manager~.  If no such connection exists 
+&	(VfsManagerConn = 0) then one is created.  
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+GetVipcConnID: PROCEDURE (pError) WORD CLEAN;
+	DCL	sVipcConnCB			SELECTOR	AT (@VfsManagerConn),
+		VipcConnCB			BASED		sVipcConnCB		VipcConnCBType;
+	
+	DCL	pError				PTR,
+		error				BASED pError		WORD;
+	DCL error1				WORD;
+	
+	error = 0;
+$IF serverVfs
+	IF VfsManagerConn <> 0 THEN error = eUserNotSignedOn;
+$ELSE
+
+	CALL GetBigVipcLock;
+	IF (VfsManagerConn <> 0) THEN
+		vipcConnCB.vfsConnections = vipcConnCB.vfsConnections + 1;
+$IF PostOffice
+	ELSE IF AutoSignonDisabled THEN error = eDlcServerNotResponding;
+$ENDIF
+	ELSE
+		DO;		/* Get a new Connection */
+		sVipcConnCB = SELECTOR$OF(IntAllocate (0, size (VipcConnCB), pError));
+		IF error = 0 THEN
+			DO;
+			vipcConnCB.clientIsVfs = TRUE;
+			vipcConnCB.vfsConnections = 1;
+
+			CALL ReleaseBigVipcLock;
+			error = VipcConnect (sVipcConnCB, @VfsManagerPathName);
+			CALL GetBigVipcLock;
+
+			/* If connect is not successful then give up memory used by 
+			vipcConnCB.   */
+
+			IF error <> 0 THEN 
+		        DO;
+			    CALL OsFree (BUILD$PTR (sVipcConnCB, 0),  @Error1);
+				VfsManagerConn = 0;
+$				IF Debugging
+				IF error1 <> 0 THEN
+					DO;
+						DCL msg CharStr ('GetVipcConnID - OsFree Error:');
+					CALL ConLineOut (@msg, size(msg));
+					CALL HexOut (error1);
+					CALL Newline;
+					END;
+$				ENDIF
+				END;
+			END;
+		END;
+	CALL ReleaseBigVipcLock;
+
+$ENDIF
+	RETURN (VfsManagerConn);
+END GetVipcConnID;
+ 
+ 
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					GiveUpVipConnection
+&	This routine is called by Attach and Detach to free up the vipc 
+&	Connection used by a vfs Connection.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+GiveUpVipcConn: PROCEDURE (vipcConnID) CLEAN;
+	DCL VipcConnID		WORD,
+		sVipcConnCB		SELECTOR	AT (@vipcConnID),
+		VipcConnCB		BASED 		sVipcConnCB		VipcConnCBType;
+
+	DCL error1			WORD;
+
+$IF serverVfs
+	DO;
+	END;
+$ELSE
+
+	CALL GetBigVipcLock;
+	vipcConnCB.vfsConnections = vipcConnCB.vfsConnections - 1;
+	
+	IF (vipcConnCB.vfsConnections = 0)
+			AND (vipcConnCB.connState <> VIPC_Cx_Connected)
+		THEN CALL VipcReleaseResources (vipcConnID);
+	CALL ReleaseBigVipcLock;
+$ENDIF
+END GiveUpVipcConn; 
+
+
+
+$EJ 
+$IF NOT serverVfs
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsResetVipcConnForDevice
+&	This routine is called to reset the vipcConnID of a device to zero.
+&	All devices share the VIpc Conn stored in VfsManagerConn.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+VfsResetVipcConnForDevice: PROCEDURE (vipcConnID) CLEAN;
+	DCL vipcConnID			WORD;
+
+$IF Debugging
+	IF vipcConnID <> VfsManagerConn THEN
+		DO;
+		DCL msg CharStr ('Something is wrong in vfResetVipcConn',cr,lf,
+						'VfsManagerConn/vipcConnID:');
+		CALL ConLineOut (@msg, size (msg));
+		CALL HexOut (VfsManagerConn);
+		CALL HexOut (VipcConnID);
+		END;
+$ENDIF
+	VfsManagerConn = 0;
+END VfsResetVipcConnForDevice;
+$ENDIF
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsInitialize:
+&
+&	Create the Vfs Process, create semaphores
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VfsInitialize: PROCEDURE WORD CLEAN;
+DCL error WORD;
+
+$IF Debugging
+	DCL msg CharStr ('Activating VFS...',cr,lf);
+	IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+		CALL COnLineOut (@msg, size(msg));
+$ENDIF
+
+
+$IF serverVfs
+	VfsResponseLock = OsCreateSemaphore (@error);
+	IF error = 0 THEN CALL OsSignal (VfsResponseLock, signalNormal, 0, @error);
+	SignonSignal = OsCreateSemaphore (@error);
+	ConnectComplete	= OsCreateSemaphore (@error);
+
+	IF error = 0 THEN VfsProcessID = OsForkProcess (
+				@VfsProcess,	/* this calls VipcProcess */
+				55,				/* high priority */
+				FALSE,			/* does not use 8087 */
+				700,			/* stackSize */
+				@Error);
+	CALL OsDelay (200);	/* let the forked process get started */
+
+$ELSE
+	error = VipcInitialize;
+$ENDIF
+
+$IF serverVfs OR PostOffice
+	/* Create a connCB for use by all VFS User layer calls. Currently the only
+	defined call is ddChangeUserContext.  The following fields in the conncb
+	are used:
+			connType
+			inUseSema
+			respReceived
+			respExpected
+			seqNumber
+			vipcConnID
+	*/
+
+	IF error = 0 THEN
+		DO;
+		sVfsLayerConnCB = SELECTOR$OF 
+			(IntAllocate (0, size (VfsLayerConnCB), @error));
+		IF error = 0 THEN
+			DO;													
+			CALL SetB (0, @VfsLayerConnCB, size (VfsLayerConnCB));
+			VfsLayerConnCB.connType = VfsConnection;
+			VfsLayerCOnnCB.inUseSema = OsCreateSemaphore (@error);
+			IF error = 0 THEN
+				DO;
+				CALL OsSignal (VfsLayerConnCB.inUseSema, 
+								signalNormal, 0, @error);
+				VfsLayerConnCB.respReceived = OsCreateSemaphore (@error);
+				END;
+			END;
+		END;
+$ENDIF
+
+$IF Debugging
+	IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Vfs Activated:');
+		DCL msg2 CharStr ('VfsLayerConnCB at :');
+		CALL COnLineOut (@msg, size (msg));
+		CALL HexOut (error);
+		CALL Newline;
+$		IF serverVfs OR postOffice
+		CALL COnLineOut (@msg2, size (msg2));
+		CALL SelectorOut (sVfsLayerConnCB);
+		CALL Newline;
+$		ENDIF
+		END;
+$ENDIF
+
+	RETURN (error);
+END VfsInitialize;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsTerminate:
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VfsTerminate: PROCEDURE WORD CLEAN;
+DCL error 	WORD;
+DCL dummy	WORD;
+
+$IF Debugging
+	DCL msg CharStr ('Terminating Vfs...',cr,lf);
+	IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+		CALL COnLineOut (@msg, size (msg));
+$ENDIF
+
+$IF serverVFS
+	CALL OsDeleteSemaphore (VfsLayerCOnnCB.inUseSema, @dummy);
+	CALL OsDeleteSemaphore (VfsLayerCOnnCB.respReceived, @dummy);
+	CALL OsFree (@vfsLayerConnCB, @dummy);
+
+	CALL OsDeleteSemaphore (VfsResponseLock, @dummy);
+	CALL OsDeleteProcess (VfsProcessID, @dummy);
+	CALL OsDeleteSemaphore (SignonSignal, @dummy);
+	CALL OsDeleteSemaphore (ConnectComplete, @dummy);
+
+$ELSEIF postOffice
+	error = VipcTerminate;
+	IF error = 0 THEN
+		DO;
+		CALL OsDeleteSemaphore (VfsLayerCOnnCB.inUseSema, @dummy);
+		CALL OsDeleteSemaphore (VfsLayerCOnnCB.respReceived, @dummy);
+		CALL OsFree (@vfsLayerConnCB, @dummy);
+		END;
+$ELSE
+	error = VipcTerminate;
+$ENDIF
+
+$IF Debugging
+	IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Vfs Terminated - error/dummy:');
+		CALL COnLineOut (@msg, size (msg));
+		CALL HexOut (error);
+		CALL HexOut (dummy);
+		CALL NewLine;
+		END;
+$ENDIF
+
+	RETURN (error);
+END VfsTerminate;
+
+
+$EJECT
+$IF serverVfs
+$INCLUDE (``Incs`VipcInterface.plmProcs.Inc~Text~)
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsProcess
+&		wait for connect signal
+&		loop
+&			wait for a message:
+&			process
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+VfsProcess: PROCEDURE CLEAN;
+DCL note				WORD;
+DCL error				WORD;
+DCL dummy				WORD;
+DCL pBuffer				PTR;
+DCl serverNameStr		BASED userInfoPtr PathNameType;
+DCL serverNameLength	BYTE;
+
+$IF Debugging
+DCL	msg1 CharStr ('Waiting for signon request',cr,lf);
+	CALL ConLineOut (@msg1, size (msg1));
+$ENDIF
+	note = OsWait (SignonSignal, NULLWORD, @error);
+	CALL NetSignon (userInfoPtr, userInfoLength, NULLPTR, 0, 
+				userInfoPtr, @error);
+	IF error = 0 THEN CALL OsAddDevice (@(7,'VfsLink'), UserInfoPtr, 
+					NULLPTR, 0, FALSE, serverBit OR invisible OR 1, @error);
+	IF error = 0 THEN
+		DO;
+		ServerNameLength = serverNameStr.length;
+		VfsManagerPathName.length = ServerNameLength + 2 
+									+ size(VfsManagerStr);
+		VfsManagerPathName.chars(0) = '`';
+		CALL MOVB  (@serverNameStr.chars,
+					@VfsManagerPathName.chars(1),
+					ServerNameLength);
+		VfsManagerPathName.chars (ServerNameLength + 1) = ':';
+		CALL MOVB  (@VfsManagerStr,
+					@VfsManagerPathName.chars(ServerNameLength + 2),
+					size(VfsManagerStr));
+$IF Debugging
+		IF (DebugMask AND Dbits_MajorEvents) <> 0 THEN 
+			DO;
+			DCL msg CharStr ('Vfs Manager Path Name:');
+			CALL ConLineOut (@msg, size (msg));
+			CALL ConLineOut (@VfsManagerPathName.chars, 
+				VfsManagerPathName.length);
+			CALL newline;
+			END;
+$ENDIF
+		VfsManagerConn = 
+			NetConnect (@VfsManagerPathName, 0, 60000, 0, @error);
+		END;
+			
+$IF Debugging
+	IF /* (error <> 0) AND */
+		((DebugMask AND Dbits_MajorEvents) <> 0) THEN 
+		DO;
+		DCL msg CharStr ('Error in Signon/Connect:');
+		CALL ConLineOut (@msg, size (msg));
+		CALL Hexout (error);
+		CALL newline;
+		END;
+$ENDIF
+	CALL OsSignal (ConnectComplete, signalNormal, error, @dummy);
+
+	DO WHILE TRUE;
+		pBuffer = OsReceive (NULLWORD, NULLWORD, NULLWORD, @note, @error);
+		IF error = 0 THEN
+			DO;
+			CALL VfsResponseArrived (pBuffer);
+			END;
+$IF Debugging
+		ELSE
+			DO;
+			DCL msg CharStr ('Unexpected error on OsReceive:');
+			CALL ConLineOut (@msg, size (msg));
+			CALL ConHexOut (error);
+			CALL newline;
+			END;
+$ENDIF
+		END;
+
+END VfsProcess;
+$ENDIF
+
+END VFS3;	/* module */

@@ -1,0 +1,194 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vfs.Ext.Inc:
+&	External definitions for all public procedures
+&	in Vfs1.Plm, Vfs2.Plm & Vfs3.Plm
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+$IF NOT Vfs1
+FsAttach: PROCEDURE (sVfsConnCB, mode, access, 
+				pPathname, pPassword) WORD EXTERNAL;
+	DCL	sVfsConnCB				SELECTOR,
+		(mode, access)			BYTE,
+		(pPathName, pPassword)	PTR;
+	END;
+
+
+FsOpen: PROCEDURE (sVfsConnCB, numBuf) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR,
+		numBuf		BYTE;
+	END;
+
+
+FsGetStatus: PROCEDURE (sVfsConnCB, pstsBuffer, length) WORD EXTERNAL;
+    DCL sVfsConnCB	SELECTOR,
+		pstsBuffer	PTR,
+		length		WORD;
+	END;
+
+
+FsSetStatus: PROCEDURE (sVfsConnCB, pstsBuffer, length) WORD EXTERNAL;
+    DCL sVfsConnCB	SELECTOR,
+		pstsBuffer	PTR,
+		length		WORD;
+	END;
+
+
+RemoteGeneral: PROCEDURE (request, conn) WORD EXTERNAL;
+	DCL request		WORD,
+		conn		SELECTOR;
+	END;
+
+FsClose: PROCEDURE (sVfsConnCB) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	END;
+
+
+FsDeleteOrDetach: PROCEDURE (request, sVfsConnCB) WORD EXTERNAL;
+	DCL request		WORD;
+	DCL	sVfsConnCB	SELECTOR;
+	END;
+
+
+FsTruncate: PROCEDURE (sVfsConnCB) WORD EXTERNAL;
+	DCL	sVfsConnCB	SELECTOR;
+	END;
+
+
+FsRename: PROCEDURE (sVfsConnCB, pNewName) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	DCL pNewName	PTR;
+	END;
+
+
+FsSeek: PROCEDURE (sVfsConnCB, seekmode, position) WORD EXTERNAL;
+	DCL	sVfsConnCB	SELECTOR;
+	DCL seekMode	BYTE;
+	DCL position	DWORD;
+	END;
+
+FsDirSeek: PROCEDURE (sVfsConnCB, seekmode, position) WORD EXTERNAL;
+	DCL	sVfsConnCB	SELECTOR;
+	DCL seekMode	BYTE;
+	DCL position	DWORD;
+	END;
+
+FsRemoteCopy: PROCEDURE (sVfsConnCB, pBuffer) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	DCL pBuffer		PTR;
+	END;
+
+$ENDIF
+
+$IF NOT Vfs2
+LocalFlush: PROCEDURE (sVfsConnCB) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	END;
+
+RemoteRead: PROCEDURE (request, conn, pBuffer, pLength) WORD EXTERNAL;
+	DCL request	 	WORD;
+	DCL conn	SELECTOR;
+	DCL pBuffer		PTR;
+	DCL pLength		PTR;
+	END;
+
+FsRead: PROCEDURE (sVfsConnCB, pBuffer, pLength) WORD EXTERNAL;
+	DCL	sVfsConnCB	SELECTOR;
+	DCL (pBuffer, pLength) PTR;
+	END;
+
+FsDirRead: PROCEDURE (sVfsConnCB, pBuffer, pLength) WORD EXTERNAL;
+	DCL	sVfsConnCB	SELECTOR;
+	DCL (pBuffer, pLength) PTR;
+	END;
+
+RemoteWrite: PROCEDURE (request, conn, pBuffer, length) WORD EXTERNAL;
+	DCL request	 	WORD;
+	DCL conn	SELECTOR;
+	DCL pBuffer		PTR;
+	DCL length		WORD;
+	END;
+
+FsWrite: PROCEDURE (sVfsConnCB, pBuffer, length) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	DCL pBuffer 	PTR;
+	DCL length		WORD;
+	END;
+
+ClearBuffer: PROCEDURE (sVfsConnCB) EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	END;
+
+RemoteSeek: PROCEDURE (sVfsConnCB, mode, position) WORD EXTERNAL;
+	DCL sVfsConnCB	SELECTOR;
+	DCL mode		BYTE;
+	DCL position	DWORD;
+	END;
+
+VfsResponseArrived: PROCEDURE (pResponse) EXTERNAL;
+	DCL pResponse 			PTR;
+	END;
+
+SendRequest: PROCEDURE (request, 	
+				sVfsConnCB, 		/* local Conn ID, also selector to CCB */
+				reqBlkLen, 			/* length of request block */
+				pFsReqBlk, 			/* pointer to request block */
+				Buflen, 			/* length of buffer - 0 if none */
+				pBuf, 				/* pointer to buf - ignored if buflen is 0 */
+				respBlkLen,			/* expected length of response - 0 if request
+									is ddRead or ddGetStatus, because response
+									length is not known, use length field of 
+									response for error checking */			
+				pError				/* pointer to error */
+					) PTR EXTERNAL;
+
+
+	DCL request		WORD, 
+		sVfsConnCB	SELECTOR,
+		reqBlkLen	WORD,
+		pFsReqBlk	PTR,
+		bufLen		WORD,
+		pBuf		PTR,
+		respBlkLen	WORD,
+		pError		PTR;
+
+	END;
+
+VfsFreeResponseBuffer: PROCEDURE EXTERNAL; END;
+$ENDIF
+
+$IF (NOT VFS3) 
+DCL filesAttached WORD EXTERNAL;
+
+VfsInitialize: PROCEDURE WORD EXTERNAL;  END;
+
+VfsTerminate: PROCEDURE WORD EXTERNAL;  END;
+
+VfsSignON: PROCEDURE (plength, pUserInfo, pDataLinkInfo) WORD EXTERNAL;
+	DCL	pLength				PTR;
+	DCL	pUserInfo			PTR;
+	DCL pDataLinkInfo		PTR;
+	END;
+
+VfsSignOFF: PROCEDURE WORD EXTERNAL;  END;
+
+$IF serverVfs OR PostOffice
+FsChangeUserContext: PROCEDURE (pBuffer, length) WORD EXTERNAL;
+	DCL pBuffer 	PTR;
+	DCL length		WORD;
+	END;
+$ENDIF
+
+GetVipcConnID: PROCEDURE (pError) WORD EXTERNAL;
+	DCL pError				PTR;
+	END;
+
+GiveUpVipcConn: PROCEDURE (vipcConnID) EXTERNAL;
+	DCL	vipcConnID		WORD;
+	END;
+
+VfsResetVipcConnForDevice: PROCEDURE (vipcConnID) EXTERNAL;
+	DCL vipcConnID		WORD;
+	END;
+$ENDIF
+

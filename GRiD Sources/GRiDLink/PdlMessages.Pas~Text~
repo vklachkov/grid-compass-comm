@@ -1,0 +1,86 @@
+$TITLE ('Phone Data Link, Messages')
+$COMPACT 
+
+MODULE PdlMessages;
+
+$nolist
+
+$INCLUDE (``Incs`OsPasTypes.Inc~Text~)
+$INCLUDE (``Incs`Common.inc~text~)
+$INCLUDE (``Incs`WindowTypes.inc~text~)
+$INCLUDE (``Incs`WindowProcs.inc~text~)
+
+$INCLUDE (``Incs`FieldTypes.inc~text~)
+$INCLUDE (``Incs`FieldProcs.inc~text~)
+
+$INCLUDE (``Incs`TableEditTypes.inc~text~)
+$INCLUDE (``Incs`TableEditProcs.inc~text~)
+
+$INCLUDE (``Incs`StringTypes.inc~text~)
+$INCLUDE (``Incs`StringProcs.inc~text~)
+
+$INCLUDE (``Incs`MessageTypes.inc~text~)
+$INCLUDE (``Incs`MessageProcs.inc~text~)
+$list
+PUBLIC	Os;
+	PROCEDURE	OsFree (VAR w: Bytes; VAR error: Bytes);
+
+PUBLIC PdlMessages;
+
+PROCEDURE PasInitMessage;
+PROCEDURE PasDisplayMessage (code: WORD);
+PROCEDURE PasFreeMessage;
+
+PRIVATE PdlMessages;
+
+VAR msg: MessagePtr;
+
+(* rudi vvv *)
+	w:			WindowRegionPtr;
+	CopyOfR:	Rectangle;
+	wError:		Word;
+(* rudi  ^^^ *)
+
+
+PROCEDURE PasInitMessage;
+VAR	tr:		Rectangle;
+BEGIN
+msg := MsgInit;
+
+WITH CopyOfR.topLeft DO BEGIN x := 0; y := 0; END;
+tr := msg^.field^.box;
+CopyOfR.extent := tr.extent;
+w := WinAllocateWindowMemory (tr.extent.x, tr.extent.y, screenFormat, wError);
+IF wError = 0 THEN
+	WinCopyRemoteRectangle (NIL, w, tr, CopyOfR.topLeft, 0);
+END;
+
+
+PROCEDURE PasDisplayMessage (code: WORD);
+var str : stringptr; b: BOOLEAN;
+BEGIN
+  CASE code OF
+     0: str := NewStringLit ('Dialing');
+     1: str := NewStringLit ('In voice mode: Confirm to enter data mode');
+	 2: str := NewStringLit ('Waiting for carrier');
+	 3: str := NewStringLit ('Data mode established');
+	 4: str := NewStringLit ('Disconnecting');
+     OTHERWISE;
+  END;
+  b := MsgShowPrompt (msg, str)
+END; {PrintMessage}
+
+
+
+PROCEDURE PasFreeMessage;
+BEGIN
+	IF wError = 0 THEN
+		BEGIN
+		WinCopyRemoteRectangle (w, NIL, CopyOfR, msg^.field^.box.topLeft, 0);
+		OsFree (w^.buf^, wError);
+		OsFree (w^, wError);
+		END;
+	Dispose (msg^.field);
+	Dispose (msg);
+END;
+.

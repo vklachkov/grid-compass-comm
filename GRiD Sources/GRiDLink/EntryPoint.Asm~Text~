@@ -1,0 +1,4 @@
+$PAGEWIDTH (132)
+%SET (ForRom, 0)
+%SET (MsDos, 0)
+$INCLUDE (EntryPoint.Inc~Text~)

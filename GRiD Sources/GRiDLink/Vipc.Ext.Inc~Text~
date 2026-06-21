@@ -1,0 +1,137 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vipc.Ext.Inc~Text~
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF DataLink
+VipcProcessDataLinkEvent: PROCEDURE (event, pFrame, errorCode) EXTERNAL;
+	DCL event				WORD, 
+		pFrame 				PTR,
+		errorCode			WORD;
+	END;
+
+$ELSEIF EntryPoint OR vfs1 OR VFS3
+
+VipcSend: PROCEDURE (vipcConnID, class, note, pVipcUserBuffer) WORD EXTERNAL;
+	DCL vipcConnID 			WORD;
+	DCL class				WORD;
+	DCL note				WORD;
+	DCL	pVipcUserBuffer		PTR;
+	END;
+
+VipcInitialize: PROCEDURE WORD EXTERNAL;  END;
+
+VipcTerminate: PROCEDURE WORD EXTERNAL;  END;
+
+$ENDIF
+
+$IF EntryPoint OR Vfs3
+VipcSignON: PROCEDURE (plength, pUserInfo, pDataLinkInfo) WORD EXTERNAL;
+	DCL	pLength				PTR;
+	DCL	pUserInfo			PTR;
+	DCL pDataLinkInfo		PTR;
+	END;
+
+VipcSignOFF: PROCEDURE WORD EXTERNAL;  END;
+
+VipcGetUserInfo: PROCEDURE (pLength, pBuffer) WORD EXTERNAL;
+	DCL plength PTR;
+	DCL pBuffer PTR;
+	END;
+
+VipcGetLinkStatus: PROCEDURE (pLength, pBuffer) WORD EXTERNAL;
+	DCL plength PTR;
+	DCL pBuffer PTR;
+	END;
+
+VipcConnect: PROCEDURE (sVipcConnCB, pPathName) WORD EXTERNAL;
+	DCL sVipcConnCB 		SELECTOR;
+	DCL	pPathName			PTR;
+	END;
+
+VipcDisConnect: PROCEDURE (sVipcConnCB) WORD EXTERNAL;
+	DCL sVipcConnCB 			SELECTOR;
+	END;
+
+VipcSetStatus: PROCEDURE (sConnCB, pBuffer, len) WORD EXTERNAL;
+	DCL sConnCB	SELECTOR;
+	DCL pBuffer	PTR;
+	DCL len		WORD;
+	END;
+
+$ENDIF
+
+$IF Vfs1 OR Vfs2 OR Vfs3
+GetBigVipcLock: PROCEDURE EXTERNAL; END;
+
+ReleaseBigVipcLock: PROCEDURE EXTERNAL; END;
+
+/* ClearSignal: PROCEDURE (semID) EXTERNAL;
+	DCL semID 	WORD;
+	END;
+*/
+VipcFreeReceiveBuffer: PROCEDURE EXTERNAL; END;
+
+VipcInternalSend: PROCEDURE (vipcConnID, headerLen, pHeader, bufferLen, pBuffer)
+						WORD EXTERNAL;
+
+	DCL vipcConnID 			WORD;
+	DCL headerLen			WORD,
+		bufferLen	 		WORD;
+	DCL pHeader				PTR,
+		pBuffer				PTR;
+	END;
+
+HowIsVipc: PROCEDURE (vipcConnID) WORD EXTERNAL; 
+	DCL vipcConnID 	WORD;
+	END;
+
+VipcReleaseResources: PROCEDURE (vipcConnID) EXTERNAL;
+	DCL vipcConnID 		WORD;
+	END;
+
+VipcEnableActivityTimeOut: PROCEDURE EXTERNAL; END;
+
+VipcDisableActivityTimeOut: PROCEDURE EXTERNAL; END;
+$ENDIF
+
+$IF Vipc2
+DCL	VipcLayerState	BYTE EXTERNAL;
+DCL pFrameArrived	PTR	EXTERNAL;	
+
+	/* this is set to point to resp when a vipc receives
+	one of SignonResp, ConnectResp, DisconnectResp */
+
+DCL SignOnSemaphore	WORD EXTERNAL;
+$ENDIF
+
+$IF Vipc1
+ValidVipcConnection: PROCEDURE (vipcConnID) BOOLEAN EXTERNAL;
+	DCL vipcConnID	WORD;
+	END;
+
+AddVipcConnIDToList: PROCEDURE (vipcConnID) WORD EXTERNAL;
+	DCL vipcConnID 	WORD;
+	END;
+
+DeleteVipcConnIDFromList: PROCEDURE (vipcConnID) EXTERNAL;
+	DCL vipcConnID 	WORD;
+	END;
+
+GetBigVipcLock: PROCEDURE EXTERNAL; END;
+
+ReleaseBigVipcLock: PROCEDURE EXTERNAL; END;
+
+VipcEnableActivityTimeOut: PROCEDURE EXTERNAL; END;
+
+VipcDisableActivityTimeOut: PROCEDURE EXTERNAL; END;
+
+DCL connectionList		(*) WORD EXTERNAL;
+
+DCL VipcConnections			BYTE EXTERNAL;
+DCL reasonForDataLinkDeath	WORD EXTERNAL;
+
+$ENDIF
+
+$IF VipcLayer
+DCL Phonelink	BOOLEAN EXTERNAL;
+$ENDIF

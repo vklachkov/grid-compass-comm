@@ -1,0 +1,1311 @@
+$TITLE ('Virtual File System Calls - Part 1')
+$COMPACT OPTIMIZE(3) SET(Vfs1)
+
+VFS1: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	This is VFS1. It contains procedures to handle
+&	the following remote file system calls.
+&
+&		ddGetStatus, ddOpen, ddClose, ddWrite, ddSeek,
+&		ddTruncate, ddAttach, ddDetach, ddRename, ddDelete,
+&		ddFlush, ddSetStatus.
+&
+&	PROCEDURES:
+&
+&		Called from EntryPoint:
+&
+&			FsAttach
+&			FsOpen
+&			FsGetStatus
+&			RemoteGeneral
+&			FsClose
+&			FsDetach
+&			FsTruncate
+&			FsRename
+&			FsSeek
+&
+&		Local:
+&
+&			LocalClose
+&			FlushForSeek
+&
+&
+&	Author:	Rajendra Shah
+&	Start Date:	12/13/82
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+$EJECT
+$SAVE NOLIST
+$INCLUDE (``Incs`Plm.Inc~Text~)
+ 
+	/* Os Constants, Types and Externals */
+	
+$INCLUDE (``OsIncs`Os.Constant.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Error.Inc~Text~)
+$INCLUDE (``Incs`Errors.Plm.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Device.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+ 
+	/* constants and types */
+	
+$INCLUDE (VfsVipc.Constant.Inc~Text~)
+$INCLUDE (VfsVipcConnCB.Type.Inc~Text~)
+$INCLUDE (VfsVipc.Type.Inc~Text~)
+ 
+	/* Externals */
+	
+$INCLUDE (Vfs.Ext.Inc~Text~)
+$INCLUDE (Vipc.Ext.Inc~Text~)
+$INCLUDE (Dlc.Ext.Inc~Text~)
+ 
+/* This is from Cp.Misc.Ext.Inc */
+
+CompareChars : PROCEDURE (pA, pB, length) BOOLEAN EXTERNAL;
+  DCL length      WORD;
+  DCL pA          PTR;
+  DCL pB          PTR;
+  END;
+
+DCL CodeW		LIT '0f7h';
+/*	tilde		LIT '07eh'; */
+
+$IF Debugging
+$INCLUDE (Debug.Inc~Text~)
+ 
+DCL	debugMask	WORD	EXTERNAL;
+$ENDIF
+$RESTORE
+ 
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsAttach
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsAttach: PROCEDURE (sVfsConnCB, mode, access, pPathname, pPassword) WORD CLEAN;
+	DCL	sVfsConnCB		SELECTOR,
+		vfsConnID		WORD  AT (@sVfsConnCB),
+		vfsConnCB		BASED sVfsConnCB VfsConnCBType;
+	
+	DCL	mode			BYTE;
+	DCL access			BYTE;
+	
+	DCL	pPathName		PTR,		
+		pathName		BASED pPathName		PathNameType;
+	
+	DCL	pPassword		PTR,
+		password		BASED pPassword		PassWordType;
+	
+	DCL (saveCh,i)		BYTE;
+	
+	DCL error			WORD;
+	DCL error1 			WORD;
+
+	DCL fsReqBlk		AttachReqType;
+	
+	DCL pFsRespBlk		PTR,
+		fsRespBlk		BASED pFsRespBlk	SimpleRespType;
+	
+	DCL pWorkPathName 	PTR,
+		workPathName	BASED pWorkPathName PathNameType;
+
+$EJECT
+
+$	IF Debugging
+	IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+	  	DO;
+			DCL msg1 CharStr (cr,lf,'ATTACH: ');
+			DCL msg2 CharStr ('  Md/Acs: ');
+		CALL ConLineOut (@msg1, size(msg1));
+		CALL ConLineOut (@pathName.chars, pathName.length);
+		IF password.length <> 0 THEN
+			DO;
+			CALL ConCharOut (' ');
+			CALL ConLineOut (@Password.chars, password.length);
+			END;
+		
+		CALL HexOut (vfsConnID);
+		CALL NewLine;
+		CALL ConLineOut (@msg2, size(msg2));
+		IF mode = 1 THEN CALL ConLineOUt (@('oldFile'), 7);
+		ELSE IF mode = 2 THEN CALL ConLineOUt (@('updateFile'), 10);
+		ELSE IF mode = 3 THEN CALL ConLineOUt (@('newFile'), 7);
+		ELSE CALL HexByteOut (mode);
+		CALL ConCharOut ('/');
+
+		IF access = 1 THEN CALL ConLineOut (@('read'),4);
+		ELSE IF access = 2 THEN CALL ConLineOut (@('write'),5);
+		ELSE IF access = 3 THEN CALL ConLineOut (@('update'),6);
+		ELSE IF access = 4 THEN CALL ConLineOut (@('updateDescriptor'),16);
+		ELSE IF access = 5 THEN CALL ConLineOut (@('shortDirectory'),14);
+		ELSE IF access = 6 THEN CALL ConLineOut (@('longDirectory'),13);
+		ELSE CALL HexByteOut (access);
+		CALL NewLine;
+	  	END;
+$	ENDIF
+
+	IF CompareChars (@(5,'`Work'), pPathName, 6) THEN
+		DO;
+		/* Since it has come here, the work is assigned to the remote
+		 server.  Translate to work path name for remote server, the 
+	     format is:
+				`<serverName>:Work
+	    */
+
+		pWorkPathName = OsGetWork;
+		i = 1;
+		DO WHILE (workPathName.chars (i) <> ':') 
+	    		AND (i < workPathName.length);
+			pathName.chars (i) = workPathName.chars (i);
+			i = i + 1;
+			END;
+
+		/* note: pathName.chars(0) was not copied, assumed to be '`'. */
+		pathName.length = i + 5;
+		CALL MovB (@(':Work'), @pathName.chars(i), 5);
+
+$		IF Debugging
+		IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+	  		DO;
+			DCL msg CharStr ('Work path name translated to:');
+			CALL ConLineOut (@msg, size(msg));
+			CALL ConLineOut (@pathName.chars, pathName.length);
+			CALL NewLine;
+			END;
+$		ENDIF
+
+		END;
+
+$EJECT
+/* Set up all the additional variables required in the CCB. 
+The variable serversConnId is to be set from the response if the
+attach is successfull */
+	
+	IF (access = shortDirAccess) 
+            		OR (access = longDirAccess) 
+		THEN vfsConnCB.accessType = readAccess;
+		ELSE vfsConnCB.accessType = access;
+
+	vfsConnCB.open,
+	vfsConnCB.serversConnID = 0;	
+	vfsConnCB.dirObjectsPerPage = MaxDirObjectsPerPage;	
+	   				/* will be used only in object mode */
+
+	vfsConnCB.connType = VfsConnection;
+ 	vfsConnCB.inUseSema = OsCreateSemaphore (@error);
+	IF error = 0 THEN vfsConnCB.RespReceived = OsCreateSemaphore (@Error);
+	IF error <> 0 THEN CALL OsDeleteSemaphore (vfsConnCB.inUseSema, @error1);
+	ELSE 
+		DO;
+
+			/* Now get the VipcConnID used by VFS for the device
+			in the pathName. IF no IPC path exists for that
+			device,  GetVipcConnID will do a VipcConnect
+			and establish one. */
+	
+		vfsConnCB.VipcConnID = GetVipcConnID (@error);
+$		IF Debugging
+		IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+	  		DO;
+			DCL msg CharStr ('Vipc ConnID used: ');
+			CALL ConLineOut (@msg, size(msg));
+			CALL HexOUt (vfsConnCB.VipcCOnnID);
+			CALL newline;
+			END;
+$		ENDIF
+	
+		IF error = 0 THEN  
+			DO;
+			fsReqBlk.mode = mode;
+			fsReqBlk.access = access;
+			IF (access = shortDirAccess) 
+            		OR (access = longDirAccess) THEN
+				DO;
+				vfsConnCB.pPage = OsAllocate (pageSize, @error);
+				vfsConnCB.open = TRUE;
+				vfsConnCB.numBuf = 1;
+				END;
+			END;
+
+		IF error = 0 THEN  
+			DO;
+	 		CALL MOVB (pPassword, @fsReqBlk.password, 17);
+
+$			IF Debugging
+  			IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+				DO;
+				CALL ConLineOut (@('  Remote Attach: '), 17);
+				CALL ConLineOut (@pathName.chars, pathName.length);
+				CALL NewLine;
+				END;
+$			ENDIF
+ 
+			filesAttached = filesAttached + 1;
+ 			pFsRespBlk = SendRequest (
+							DOUBLE (ddAttach),
+							sVfsConnCB,
+							SIZE (fsReqBlk),
+							@fsReqBlk,
+							pathName.length+1,
+							pPathName,
+							SIZE (fsRespBlk),
+							@Error);
+				
+			IF error = 0 THEN
+				DO;
+				vfsConnCB.serversConnID = fsRespBlk.serversConnID;
+
+				CALL VfsFreeResponseBuffer;
+				CALL ClearBuffer (sVfsConnCB);
+				CALL OsSignal (vfsConnCB.inUseSema, 
+ 									signalNormal,
+									0,
+									@error);
+				END;
+
+			ELSE IF (access = shortDirAccess) 
+            		OR (access = longDirAccess) THEN
+				DO;
+				CALL OsFree (vfsConnCB.pPage, @error1);
+$				IF Debugging
+				IF error1 <> 0 THEN
+					DO;
+						DCL msg CharStr ('Attach - OsFree Error:');
+					CALL ConLineOut (@msg, size(msg));
+					CALL HexOut (error1);
+					CALL Newline;
+					END;
+$				ENDIF
+				END;
+	
+			IF error <> 0 THEN 
+				DO;
+				CALL GiveUpVipcConn (vfsConnCB.vipcConnID);
+				filesAttached = filesAttached - 1;
+				END;
+			END;
+
+		IF error <> 0 THEN
+			DO;
+				/* delete the semaphores used by this connection */
+	
+			CALL OsDeleteSemaphore (vfsConnCB.inUseSema, @error1);
+			CALL OsDeleteSemaphore (vfsConnCB.respReceived, @error1);
+			END;
+		END;
+
+AttachExit:
+
+$	IF debugging
+	IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+		DO;
+		CALL ConLineOut (@('Attach Complete:'), 16);
+		CALL HexOut (error);
+		CALL NewLine;
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+		END;
+$	ENDIF
+ 
+	RETURN (error);
+	
+END FsAttach; /* FsAttach */
+
+ 
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsDetach
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsDeleteOrDetach: PROCEDURE (request, sVfsConnCB) WORD CLEAN;
+	DCL request			WORD;
+	DCL	sVfsConnCB		SELECTOR,
+	  	vfsConnID		WORD	AT (@sVfsConnCB),
+		vfsConnCB		BASED sVfsConnCB VfsConnCBType;
+	
+	DCL vipcConnID		WORD,
+		sVipcConnCB		SELECTOR	AT (@vipcConnID),
+		VipcConnCB		BASED 		sVipcConnCB		VipcConnCBType;
+		
+	DCL error			WORD;
+	DCL error1			WORD;
+	
+	
+$IF debugging
+	IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+	  DO;
+		IF request = ddDetach THEN CALL ConLineOut (@(cr,lf,'DETACH:'), 9);
+		ELSE CALL ConLineOut (@(cr,lf,'DELETE:'), 9);
+		CALL HexOut (vfsConnID);
+		CALL NewLine;
+	  END;
+$ENDIF
+ 
+	error = 0;
+
+	IF request = ddDelete THEN
+		DO;
+		IF NOT vfsConnCB.open THEN error = eFileNotOpen;
+		ELSE 
+			DO;
+			/* We don't know now (11/20/84) how access controls will be 
+			implemented in the file system.  It may be thus be a valid
+			situation were WRITEs are not allowed but DELETE is.  Hence
+			go ahead and flush the buffer, and do a DELETE irrespective
+			of the error */
+
+			error = LocalFlush (sVfsConnCB);
+$IF Debugging
+			IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+		  		DO;
+				DCL msg CharStr ('  Remote Delete:');
+	        	CALL ConLineOut (@msg, size (msg));
+				CALL HexOut (vfsCOnnID);
+				CALL newline;
+				END;
+$ENDIF
+			error = RemoteGeneral (ddDelete, sVfsConNCB);
+			IF error = 0 THEN error1 = LocalClose (sVfsConnCB);
+			END;
+		END;
+
+	ELSE /* if request = ddDetach */
+		DO;
+		IF vfsConnCB.open THEN error = LocalClose (sVfsConnCB);
+$IF Debugging
+		IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+		  	DO;
+			DCL msg CharStr ('  Remote Detach:');
+	        CALL ConLineOut (@msg, size (msg));
+			CALL HexOut (vfsCOnnID);
+			CALL newline;
+			END;
+$ENDIF
+		error = RemoteGeneral (ddDetach, sVfsConNCB);
+		END;
+
+	IF (error = 0) OR (request = ddDetach) THEN
+		DO;
+			/* delete the semaphores used by this connection */
+	
+		CALL OsDeleteSemaphore (vfsConnCB.inUseSema, @error1);
+		CALL OsDeleteSemaphore (vfsConnCB.respReceived, @error1);
+
+		CALL GiveUpVipcConn (vfsConnCB.vipcConnID);
+		filesAttached = filesAttached - 1;
+		END;
+
+	ELSE CALL OsSignal (vfsConnCB.inUseSema, signalNormal, 0, @error1);
+
+$IF Debugging
+	IF (debugMask AND Dbits_FsAttach) <> 0 THEN
+	  DO;
+		IF request = ddDetach 
+			THEN CALL ConLineOut (@('Detach Complete:'), 16);
+			ELSE CALL ConLineOut (@('Delete Complete:'), 16);
+		CALL HeXout (error);
+		CALL Newline;
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+	  END;
+$ENDIF
+
+ 	RETURN (error);
+END FsDeleteOrDetach;
+
+ 
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsOpen
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsOpen: PROCEDURE (sVfsConnCB, numBuf) WORD CLEAN;
+	DCL sVfsConnCB	SELECTOR,
+		vfsConnID	WORD	AT (@sVfsConnCB),
+		vfsConnCB	BASED	sVfsConnCB	 VfsConnCBType;
+	
+	DCL numBuf		BYTE;
+	
+	DCL error		WORD;
+	DCL fsReqBlk	OpenReqType;
+	
+	DCL pFsRespBlk	PTR,
+		fsRespBlk	BASED pFsRespBlk	SimpleRespType;
+	
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@(cr,lf,'Open-cid/Numbuf:'), 18);
+		CALL HexOut (vfsConnID);
+		CALL HexByteOut (numBuf);
+		CALL NewLine;
+	  END;
+$ENDIF
+
+	IF vfsConnCB.open THEN error = eOpen;
+	ELSE 
+		DO; 
+		fsReqBlk.numBuf = numBuf;
+		vfsConnCB.numBuf = numBuf;
+		vfsConnCB.direction = 0; 
+	
+		pFsRespBlk = SendRequest (
+						DOUBLE (ddOpen),
+						sVfsConnCB,
+						SIZE (fsReqBlk),
+						@fsReqBlk,
+						0,
+						0ffffh,
+						SIZE (fsRespBlk),
+						@Error);
+	
+		IF error = 0 THEN
+			DO;
+			CALL VfsFreeResponseBuffer;
+			/* numbuf is currently ignored */
+			vfsConnCB.pPage = OsAllocate (pageSize, @error);
+			IF error = 0 THEN vfsConnCB.open = TRUE;
+			END;
+		END;
+
+$	IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Open Complete:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (error);
+		CALL Newline;
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+		END;
+$	ENDIF
+ 
+	RETURN (error);
+	
+END FsOpen;
+ 
+ 
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				NoOfObjectsBetween
+&	Returns number of dir objects between startPos and EndPos in the current
+&	page.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+NoOfObjectsBetween: PROCEDURE (startPos, endPos, sVfsConnCB) WORD CLEAN;
+	DCL	sVfsConnCB			SELECTOR,
+		vfsConnCB			BASED sVfsConnCB VfsConnCBType;
+	
+	DCL startPos			WORD,
+		endPos				WORD;
+
+	DCL pDirEntry			PTR,
+		dirEntry			BASED pDirEntry DirectoryEntryType,
+		completeDirEntry	BASED pDirEntry CompleteDirEntryType;
+
+	DCL pLocalBuffer		PTR,
+		localBuffer			BASED pLocalBuffer (1)	BYTE;
+
+	DCL noOfObjects			WORD;
+
+	noOfObjects = 0;
+	pLocalBuffer = vfsConnCB.pPage;
+
+	DO WHILE endPos > startPos;
+		pDirEntry = @localBuffer (startPos);
+
+$		IF Debugging
+		IF FsMaskSet THEN 
+			DO;
+			DCL msg1 CharStr ('Skipping over directry Object:');
+			DCL msg2 CharStr (cr,lf,'startpos/endPos:');
+			CALL ConLineOUt (@msg1, size(msg1));
+			CALL conLineOut (@dirEntry.name, dirEntry.length);
+			CALL ConLineOUt (@msg2, size(msg2));
+			CALL DecimalOut (startpos);
+			CALL DecimalOut (endpos);
+			CALL newline;
+			END;
+$		ENDIF
+
+		IF vfsConnCB.objectMode = directoryMode
+			THEN startPos = startpos + dirEntry.length
+                		+ size (dirEntry) - 1;
+			ELSE startPos = startpos + size (completeDirEntry);
+		noOfObjects = noOfObjects + 1;
+		END;
+
+$		IF Debugging
+		IF startPos > endPos THEN
+			DO;
+				DCL msg CharStr ('Inconsistent object length in GetStatus',cr,lf);
+			DCL msg2 CharStr (cr,lf,'startpos/endPos:');
+			CALL ConLineOut (@msg, size (msg));
+			CALL ConLineOUt (@msg2, size(msg2));
+			CALL DecimalOut (startpos);
+			CALL DecimalOut (endpos);
+			CALL newline;
+			END;
+$		ENDIF
+
+	RETURN (noOfObjects);	
+END NoOfObjectsBetween;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Get Status
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsGetStatus: PROCEDURE (sVfsConnCB, pstsBuffer, length) WORD CLEAN;
+	DCL sVfsConnCB		SELECTOR,
+		vfsConnID		WORD 	AT (@sVfsCOnnCB),
+		vfsConnCB		BASED 	sVfsConnCB VfsConnCBType;
+	
+	DCL	pstsBuffer	PTR,
+		stsBuffer	BASED pstsBuffer StatusType;
+	
+	DCL fakeStsBuffer	BASED sVfsConnCB StatusType;
+
+	DCL error			WORD;
+	DCL length			WORD;
+	DCL cnt				WORD;
+	
+$IF debugging
+	IF FsMaskSet THEN
+	  DO;
+			DCL msg CHarStr (cr,lf,'GETSTATUS-cid/len:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (vfsConnID);
+		CALL HexOut (length);
+		CALL NewLine;
+	  END;
+$ENDIF
+
+	IF vfsConnCB.pageDirty THEN error = LocalFlush (sVfsConnCB);
+	ELSE error = 0;
+
+	IF error = 0 THEN 
+		DO;
+		cnt = length;
+		error = RemoteRead (DOUBLE (ddGetStatus),
+							sVfsConnCB,
+							pstsBuffer,
+							@cnt);
+
+		IF (error = 0) THEN
+			DO;
+			IF vfsConnCB.objectMode = byteMode THEN
+				DO;
+				IF (vfsConnCB.pageRead) AND 
+					(length >= (OFFSET$OF (@fakeStsBuffer.filePosition) + 
+								SIZE (fakeStsBuffer.filePosition)))
+					THEN stsBuffer.filePosition = stsBuffer.filePosition
+					 	- (vfsConnCB.lenBuffer - vfsConnCB.locBuffer);
+				END;
+
+			ELSE
+				DO;
+				/* Also need to adjust curEntry field of GetStatusInfo. 
+                in object mode it is only read access */			
+				cnt = NoOfObjectsBetween (vfsConnCB.locBuffer,
+										vfsConnCB.lenBuffer,
+										sVfsConnCB);
+				IF vfsConnCB.direction = readForward THEN 
+					DO;
+					IF (length >= (OFFSET$OF (@fakeStsBuffer.curEntry) + 
+								SIZE (fakeStsBuffer.curEntry)))
+				    	THEN stsBuffer.curEntry = stsBuffer.curEntry - cnt;
+					IF (length >= (OFFSET$OF (@fakeStsBuffer.filePosition) + 
+								SIZE (fakeStsBuffer.filePosition)))
+						THEN stsBuffer.filePosition = stsBuffer.filePosition 
+						 	- (vfsConnCB.lenBuffer - vfsConnCB.locBuffer);
+					END;
+				ELSE 
+				  	DO;
+					IF (length >= (OFFSET$OF (@fakeStsBuffer.curEntry) + 
+								SIZE (fakeStsBuffer.curEntry)))
+				    	THEN stsBuffer.curEntry = stsBuffer.curEntry + cnt;
+					IF (length >= (OFFSET$OF (@fakeStsBuffer.filePosition) + 
+								SIZE (fakeStsBuffer.filePosition)))
+						THEN stsBuffer.filePosition = stsBuffer.filePosition 
+						 	+ (vfsConnCB.lenBuffer - vfsConnCB.locBuffer);
+					END;
+				END;
+			END;
+		END;
+
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  	DO;
+		DCL msg CharStr ('GetStatus Complete - Error/FilePosition:');
+		CALL ConLineOut (@msg, size (msg));
+		CALL HeXout (error);
+		CALL HexDwordOut (stsBuffer.filePosition);
+		CALL Newline;
+		END;
+$ENDIF
+ 
+	RETURN (error);
+END FsGetStatus;
+ 
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Set Status
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsSetStatus: PROCEDURE (sVfsConnCB, pStsBuffer, length) WORD CLEAN;
+	DCL sVfsConnCB		SELECTOR,
+		vfsConnID		WORD 	AT (@sVfsCOnnCB),
+		vfsConnCB		BASED 	sVfsConnCB VfsConnCBType;
+	
+	DCL	pstsBuffer		PTR,
+		stsBuffer		BASED pstsBuffer (1) BYTE;
+
+	DCL error			WORD;
+	DCL length			WORD;
+	DCL j				WORD;
+	DCL k				WORD;
+	DCL partialWildCard	BOOLEAN;
+	
+	DCL pSetStatusEntry	PTR,
+		setStatusEntry	BASED pSetStatusEntry SetStatusEntryType;
+		
+$	IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  	DO;
+		CALL ConLineOut (@(cr,lf,'SETSTATUS-cid/len:'), 20);
+		CALL HexOut (vfsConnID);
+		CALL HexOut (length);
+		CALL NewLine;
+	  	END;
+$	ENDIF
+
+	error = 0;
+	IF (vfsConnCB.objectMode = directoryMode) OR
+		(vfsConnCB.objectMode = completeDirectoryMode) THEN 
+		DO;
+			/* scan set status buffer to see if direction is set or if partial
+	        wild card is set. */
+
+		j = 0;
+		DO WHILE J < length;
+			pSetStatusEntry = @stsBuffer (j);
+			IF setStatusEntry.entryID = setDirection THEN
+				DO;
+				/* Yes direction is being changed, clear local buffer, and
+				before that send an appropriate seek to synchronize local 
+				buffer with remote */
+
+$				IF debugging
+				IF (debugMask AND Dbits_Fs) <> 0 THEN
+				  	DO;
+						DCL msg CharStr ('Set Direction: dir =');
+					CALL ConLineOut (@msg,  size(msg));
+					CALL HexByteOut (setStatusEntry.statusData (0));
+					CALL newline;
+			  		END;
+$				ENDIF
+
+				IF vfsCOnnCB.direction = readForward 
+				 	THEN error = DirSyncAndSeek (sVfsConnCB, seekRelBackwards, 0);
+					ELSE error = DirSyncAndSeek (sVfsConnCB, seekRelForwards, 0);
+				vfsConnCB.direction = setStatusEntry.statusData (0);
+				END;
+
+			ELSE IF setStatusEntry.entryID = setWildCard THEN
+				DO;
+				/* If partial wild card is set, then do not buffer directory
+	            objects.  If directory objects are buffered for partial wild
+				cards then getstatus and seek get out of sync and do not work
+				in compatible manner with CCOS.  To achieve this simply set
+				dirObjectsPerpage to 1 */
+
+				partialWildCard = FALSE;
+				DO k = 0 TO setSTatusEntry.length-1;
+					IF (setStatusEntry.statusData (k) <> CodeW)
+						AND (setStatusEntry.statusData (k) <> Tilde)
+					THEN partialWildCard = TRUE;
+					END;
+
+				IF partialWildCard THEN
+					DO;
+					vfsConnCB.dirObjectsPerPage = 1;	
+$					IF debugging
+					IF (debugMask AND Dbits_Fs) <> 0 THEN
+					  	DO;
+						DCL msg CharStr ('Partial Wild Card Set: ');
+						CALL ConLineOut (@msg,  size(msg));
+						CALL ConLineOut (@setStatusEntry.statusData,
+				    				setStatusEntry.length);
+						CALL newline;
+			  			END;
+$					ENDIF
+					END;
+
+				END;
+
+			j = j + setStatusEntry.length + (size (setstatusEntry) - 1);
+			END;
+		END;
+
+	IF error = 0 THEN error = RemoteWrite (DOUBLE (ddSetStatus),
+										sVfsConnCB,
+										pStsBuffer,
+										length);
+
+
+	IF (error = 0) AND (vfsConnCB.objectMode = byteMode) THEN
+		DO;
+		/* scan set status buffer to see if setAccessRights was 
+		one of the commands.  Change access accordingly. */
+
+		j = 0;
+		DO WHILE j < length;
+			pSetStatusEntry = @stsBuffer (j);
+			IF setStatusEntry.entryID = setAccessRights THEN
+				DO;
+				vfsConnCB.accessType = setStatusEntry.statusData (0);
+$				IF debugging
+				IF (debugMask AND Dbits_Fs) <> 0 THEN
+				  	DO;
+						DCL msg CharStr ('Set Access Rights: new access =');
+					CALL ConLineOut (@msg,  size(msg));
+					CALL HexByteOut (setStatusEntry.statusData (0));
+					CALL newline;
+			  		END;
+$				ENDIF
+				END;
+
+			j = j + setStatusEntry.length + (size (setstatusEntry) - 1);
+			END;
+		END;
+		
+$	IF Debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  	DO;
+		CALL ConLineOut (@('SETSTATUS Complete:'), 19);
+		CALL HeXout (error);
+		CALL Newline;
+	  END;
+$	ENDIF
+ 
+	RETURN (error);
+	
+END FsSetStatus;
+ 
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					OsClose
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsClose: PROCEDURE (sVfsConnCB) WORD CLEAN;
+	DCL sVfsConnCB	SELECTOR,
+		vfsConnID	WORD AT (@sVfsConnCB);
+	DCL error		WORD;
+	
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@(cr,lf,'CLOSE:'), 8);
+		CALL HexOut (vfsConnID);
+		CALL NewLine;
+	  END;
+	
+	IF (error := LocalClose (sVfsConnCB)) = 0 THEN
+	  DO;
+		IF (debugMask AND Dbits_Fs) <> 0 
+		  THEN CALL ConLineOut (@('  Remote Close',cr,lf), 16);
+		error = RemoteGeneral (DOUBLE (ddClose), sVfsConnCB);
+	  END;
+	
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@('Close Complete:'), 15);
+		CALL HeXout (error);
+		CALL Newline;
+	  END;
+
+$ELSE
+
+	IF (error := LocalClose (sVfsConnCB)) = 0 THEN
+	  DO;
+		error = RemoteGeneral (DOUBLE (ddClose), sVfsConnCB);
+	  END;
+
+$ENDIF
+	
+	RETURN (error);
+	
+END FsClose;
+ 
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	LocalCLose:
+&	Used by OsCLose and OsDetach
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+LocalClose: PROCEDURE (sVfsConnCB) WORD REENTRANT;
+	DCL sVfsConnCB		SELECTOR,
+		vfsConnCB		BASED sVfsConnCB		VfsConnCBType;
+	
+	DCL error		WORD;
+	DCL error1		WORD;
+	
+	/* zzz check here if buffer was allocated */
+	IF vfsConnCB.pageDirty THEN error = LocalFlush (sVfsConnCB);
+	ELSE
+		DO;
+		error = 0;
+		CALL ClearBuffer (sVfsConnCB);
+		END;
+	
+	vfsConnCB.open = FALSE;
+	CALL OsFree (vfsConnCB.pPage, @error1);
+$	IF Debugging
+	IF error1 <> 0 THEN
+		DO;
+			DCL msg CharStr ('Local Close - OsFree Error:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (error1);
+		CALL Newline;
+		END;
+$		ENDIF
+
+	RETURN (error);
+END LocalClose;
+ 
+ 
+ 
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				OsTruncate
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsTruncate: PROCEDURE (sVfsConnCB) WORD CLEAN;
+	DCL	sVfsConnCB		SELECTOR,
+	  	vfsConnID		WORD	AT (@sVfsConnCB),
+		vfsConnCB		BASED sVfsConnCB VfsConnCBType;
+	
+	DCL error	WORD;
+	
+$IF Debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@(cr,lf,'TRUNCATE:'), 11);
+		CALL HexOut (vfsConnID);
+		CALL NewLine;
+	  END;
+ 
+	IF vfsConnCB.accessType = readAccess THEN error = eAccess;
+	ELSE IF (error := LocalFlush (sVfsConnCB)) = 0 THEN
+	  DO;
+		IF (debugMask AND Dbits_Fs) <> 0 THEN
+		  DO;
+			CALL ConLineOut (@('  Remote Truncate:'), 18);
+			CALL HexOut (vfsConnID);
+			CALL NewLine;
+ 		  END;
+ 		error = RemoteGeneral (DOUBLE (ddTruncate), sVfsConnCB);
+	  END;
+	
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@('Truncate Complete:'), 18);
+		CALL HeXout (error);
+		CALL Newline;
+	  END;
+
+$ELSE
+
+	IF vfsConnCB.accessType = readAccess THEN RETURN (eAccess);
+	IF (error := LocalFlush (sVfsConnCB)) = 0 THEN
+ 		error = RemoteGeneral (DOUBLE (ddTruncate), sVfsConnCB);
+	
+$ENDIF
+
+	RETURN (error);
+END FsTruncate; /* FsTruncate */
+ 
+ 
+ 
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				OsRename
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsRename: PROCEDURE (sVfsConnCB, pNewName) WORD CLEAN;
+	DCL sVfsConnCB	SELECTOR,
+	  	vfsConnID	WORD	AT (@sVfsConnCB);
+	
+	DCL error		WORD;
+	DCL fsReqBlk	RenameReqType;
+	
+	DCL pFsRespBlk	PTR,
+		fsRespBlk	BASED pFsRespBlk	SimpleRespType;
+	
+	DCL pNewName	PTR,
+		newName		BASED pNewName		FileNameType;
+	
+	
+$IF Debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@(cr,lf,'Rename-cid/fNm:'), 17);
+		CALL HexOut (vfsConnID);
+		CALL ConCharOut (' ');
+		CALL ConLineOut (@newName.chars, newName.length);
+		CALL NewLine;
+	  END;
+$ENDIF
+ 
+	pFsRespBlk = SendRequest (
+						DOUBLE (ddRename),
+						sVfsConnCB,
+						SIZE (fsReqBlk),
+						@fsReqBlk,
+						newName.length+1,
+						pNewName,
+						SIZE (fsRespBlk),
+						@Error);
+	
+	IF error = 0 THEN CALL VfsFreeResponseBuffer;
+	
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  	DO;
+		CALL ConLineOut (@('Rename Complete:'), 16);
+		CALL HeXout (error);
+		CALL Newline;
+		IF (debugMask AND Dbits_SingleStep) <> 0 THEN CALL PrintTimings;
+	  	END;
+$ENDIF
+ 
+	RETURN (error);
+END FsRename;
+ 
+ 
+ 
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				FlushForSeek
+&	limited Flush used by FsSeek only.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+FlushForSeek: PROCEDURE (sVfsConnCB) WORD REENTRANT;
+	DCL sVfsConnCB		SELECTOR,
+		vfsConnCB		BASED sVfsConnCB	VfsConnCBType;
+	
+	DCL error		WORD;
+	
+	error = 0;
+	IF vfsConnCB.pageDirty THEN
+		DO;
+			IF vfsConnCB.pageRead THEN
+				error = RemoteSeek (sVfsConnCB,
+									seekRelBackwards,
+									DOUBLE (vfsConnCB.lenBuffer));
+			IF error = 0 THEN
+				error = RemoteWrite (DOUBLE (ddWrite),
+									sVfsConnCB,
+									vfsConnCB.pPage,
+									vfsConnCB.lenBuffer);
+		END;
+	RETURN (error);
+END FlushForSeek;
+ 
+ 
+DirSyncAndSeek: PROCEDURE (sVfsConnCB, seekMode, position) WORD REENTRANT;
+	DCL sVfsConnCB		SELECTOR,
+		vfsConnCB		BASED sVfsConnCB	VfsConnCBType;
+	
+	DCL seekMode		BYTE;
+	DCL position 		DWORD;
+
+	DCL pDirEntry			PTR,
+		dirEntry			BASED pDirEntry DirectoryEntryType,
+		completeDirEntry	BASED pDirEntry CompleteDirEntryType;
+
+	DCL pLocalBuffer		PTR,
+		localBuffer			BASED pLocalBuffer (1) BYTE;
+
+	pLocalBuffer = vfsConnCB.pPage;
+	DO WHILE (vfsConnCB.lenBuffer > vfsConnCB.locBuffer);
+		pDirEntry = @localBuffer (vfsConnCB.locBuffer);
+$		IF Debugging
+		IF ((debugMask AND Dbits_SingleStep) <> 0) 
+		  AND ((debugMask AND Dbits_Fs) <> 0) THEN
+			DO;
+				DCL msg CharStr ('Object seeked over: ');
+				DCL ch BYTE;
+			CALL ConLineOut (@msg, size(msg));
+			CALL ConLineOut (@dirEntry.name, dirEntry.length);
+			CALL PrintTimings;
+	 		END;
+$		ENDIF
+		IF vfsConnCB.objectMode = directoryMode
+			THEN vfsConnCB.locBuffer = vfsConnCB.locBuffer + dirEntry.length
+                				+ size (dirEntry) - 1;
+			ELSE vfsConnCB.locBuffer = vfsConnCB.locBuffer 
+			     				+ size (completeDirEntry);
+		position = position + 1;
+		END;
+
+$	IF Debugging
+	IF vfsConnCB.locBuffer > vfsConnCB.lenBuffer THEN
+		DO;
+			DCL msg CharStr ('Inconsistent object length in Dir Read',cr,lf);
+		CALL ConLineOut (@msg, size (msg));
+		END;
+$	ENDIF
+
+	CALL ClearBuffer (sVfsConnCB);
+	IF position <> 0 
+	 	THEN RETURN (RemoteSeek (sVfsConnCB, SeekMode, position));
+		ELSE RETURN (0);
+
+END DirSyncAndSeek;	
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				OsSeek in object mode
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsDirSeek: PROCEDURE (sVfsConnCB, seekmode, position) WORD CLEAN;
+	DCL	sVfsConnCB			SELECTOR,
+		vfsConnCB			BASED sVfsConnCB VfsConnCBType;
+	
+	DCL seekMode			BYTE;
+	DCL position			DWORD;
+	
+	DCL error				WORD;
+	
+	DCL pDirEntry			PTR,
+		dirEntry			BASED pDirEntry DirectoryEntryType,
+		completeDirEntry	BASED pDirEntry CompleteDirEntryType;
+
+	DCL pLocalBuffer		PTR,
+		localBuffer			BASED pLocalBuffer (1)	BYTE;
+
+$	IF Debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  	DO;
+			DCL msg CHarStr (cr,lf,'DIR SEEK-md/pos: ');
+		CALL ConLineOut (@msg, size (msg));
+		IF seekMode = 1 THEN CALL ConLineOut (@('Backward '),9); 
+		ELSE IF seekMode = 2 THEN CALL ConLineOut (@('Absolute '),9); 
+		ELSE IF seekMode = 3 THEN CALL ConLineOut (@('Forward '),8); 
+		ELSE IF seekMode = 4 THEN CALL ConLineOut (@('FromEnd '),8); 
+		ELSE CALL HexByteOut (seekmode);
+		CALL HexDwordOut (position);
+		CALL NewLine;
+		END;
+$	ENDIF
+ 
+	error = 0;
+	pLocalBuffer = vfsConnCB.pPage;
+	IF ((seekMode = SeekRelForwards) AND (vfsConnCB.direction = readForward)) 
+    		OR 
+		((seekMode = SeekRelBackwards) AND (vfsConnCB.direction = readBackWard))
+	THEN
+		DO;
+		DO WHILE (position > 0) AND (vfsConnCB.lenBuffer > vfsConnCB.locBuffer);
+			pDirEntry = @localBuffer (vfsConnCB.locBuffer);
+			IF vfsConnCB.objectMode = directoryMode
+				THEN vfsConnCB.locBuffer = vfsConnCB.locBuffer + dirEntry.length
+                				+ size (dirEntry) - 1;
+				ELSE vfsConnCB.locBuffer = vfsConnCB.locBuffer 
+			     				+ size (completeDirEntry);
+			position = position - 1;
+			END;
+	
+$		IF Debugging
+		IF vfsConnCB.locBuffer > vfsConnCB.lenBuffer THEN
+			DO;
+				DCL msg CharStr ('Inconsistent object length in Dir Read',cr,lf);
+			CALL ConLineOut (@msg, size (msg));
+			END;
+$		ENDIF
+
+		IF position > 0 THEN
+			DO;	/* remote seek required */
+			CALL ClearBuffer (sVfsConnCB);
+			error = RemoteSeek (sVfsConnCB, SeekMode, position);
+			END;
+		END;
+	
+	ELSE IF (seekMode = SeekRelBackwards) OR (seekMode = SeekRelForwards) 
+		/* It actually means seekMode = relBackwards and dir = forward
+		or seekmode = relforwards and dir = backwards */ 
+
+    	THEN error = DirSyncAndSeek (sVfsConnCB, seekMode, position);
+	
+	ELSE IF (seekMode = SeekToHere) OR (seekMode = SeekFromEnd) THEN
+		DO;
+		error = RemoteSeek (sVfsConnCB, seekMode, position);
+		CALL ClearBuffer (sVfsConnCB);
+		END;
+	
+	ELSE error = eParam; /* Invalid seek mode */
+	
+$	IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@('Dir Seek Complete:'), 18);
+		CALL HeXout (error);
+		CALL Newline;
+	  END;
+$	ENDIF
+ 
+	RETURN (error);
+	
+END FsDirSeek;
+ 
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&				OsSeek
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+FsSeek: PROCEDURE (sVfsConnCB, seekmode, position) WORD CLEAN;
+	DCL	sVfsConnCB		SELECTOR,
+		vfsConnCB		BASED sVfsConnCB VfsConnCBType;
+	
+	DCL seekMode	BYTE;
+	DCL position	DWORD;
+	
+	DCL error		WORD;
+	
+$IF Debugging
+	IF FsMaskSet THEN
+	  	DO;
+		DCL msg CharStr (cr,lf,'SEEK-md/pos:');
+		CALL ConLineOut (@msg, size (msg));
+		IF seekMode = 1 THEN CALL ConLineOut (@('Backward '),9); 
+		ELSE IF seekMode = 2 THEN CALL ConLineOut (@('Absolute '),9); 
+		ELSE IF seekMode = 3 THEN CALL ConLineOut (@('Forward '),8); 
+		ELSE IF seekMode = 4 THEN CALL ConLineOut (@('FromEnd '),8); 
+		ELSE CALL HexByteOut (seekmode);
+		CALL HexDwordOut (position);
+		CALL NewLine;
+		END;
+$ENDIF
+ 
+	error = 0;
+	IF seekMode = SeekRelBackwards THEN
+		DO;
+			IF position <= vfsConnCB.locBuffer THEN
+			  DO;	/* only local seek required */
+					vfsConnCB.locBuffer = vfsConnCB.locBuffer - position;
+			  END;
+	
+			ELSE
+			  DO;	/* remote seek required, flush current buffer if
+					dirty and adjust remote pointers */
+				IF (error := FlushForSeek (sVfsConnCB)) = 0 THEN
+				  DO;
+					IF (vfsConnCB.pageDirty OR vfsConnCB.pageRead) THEN
+						position = position + vfsConnCB.lenBuffer
+									- vfsConnCB.locBuffer;
+					error = RemoteSeek (sVfsConnCB,
+											SeekRelBackwards,
+											position);
+				  END;
+				CALL ClearBuffer (sVfsConnCB);
+			  END;
+		END;
+	
+	ELSE IF seekMode = SeekRelForwards THEN
+		DO;
+			IF position <= (vfsConnCB.lenBuffer - vfsConnCB.locBuffer) THEN
+			  DO;  /* only local seek required */
+				vfsConnCB.locBuffer = vfsConnCB.locBuffer + position;
+			  END;
+	
+			ELSE
+			  DO;	/* remote seek required, flush current buffer if
+					dirty and adjust remote pointers */
+				IF (error := FlushForSeek (sVfsConnCB)) = 0 THEN
+				  DO;
+					error = RemoteSeek (sVfsConnCB,
+										SeekRelForwards,
+										position - (vfsConnCB.lenBuffer
+												- vfsConnCB.locBuffer));
+				  END;
+				CALL ClearBuffer (sVfsConnCB);
+			  END;
+		END;
+	
+	ELSE IF (seekMode = SeekToHere) OR (seekMode = SeekFromEnd) THEN
+		DO;
+			IF (error := FlushForSeek (sVfsConnCB)) = 0
+				THEN error = RemoteSeek (sVfsConnCB,
+										seekMode,
+										position);
+			CALL ClearBuffer (sVfsConnCB);
+		END;
+	
+	ELSE error = eParam; /* Invalid seek mode */
+	
+$IF debugging
+	IF (debugMask AND Dbits_Fs) <> 0 THEN
+	  DO;
+		CALL ConLineOut (@('Seek Complete:'), 14);
+		CALL HeXout (error);
+		CALL Newline;
+	  END;
+$ENDIF
+ 
+	RETURN (error);
+	
+END FsSeek;
+ 
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&					Remote General
+&	This routine handles the following remote filesystem calls:
+&	OsClose,  OsDelete, OsTruncate, and OsFlushAllBuffers.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+ 
+RemoteGeneral: PROCEDURE (request, conn) WORD CLEAN;
+	DCL request		WORD,
+		conn		SELECTOR;
+	
+	DCL error		WORD;
+	
+	DCL fsReqBlk	SimpleReqType;
+	
+	DCL pFsRespBlk	PTR,
+		fsRespBlk	BASED pFsRespBlk	SimpleRespType;
+	
+	pFsRespBlk = SendRequest (
+						request,
+						conn,
+						SIZE (fsReqBlk),
+						@fsReqBlk,
+						0,
+						0ffffh,
+						SIZE (fsRespBlk),
+						@Error);
+	
+	IF error = 0 THEN CALL VfsFreeResponseBuffer;
+	
+$IF Debugging
+	IF ((debugMask AND Dbits_SingleStep) <> 0) 
+	  AND ((debugMask AND Dbits_Fs) <> 0) THEN CALL PrintTimings;
+$ENDIF
+
+	RETURN (error);
+	
+END RemoteGeneral;
+ 
+
+END Vfs1;	/* module */

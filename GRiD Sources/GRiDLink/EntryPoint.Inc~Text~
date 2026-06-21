@@ -1,0 +1,193 @@
+; This is start.asm.  This acts as a main
+; module for gridlink & phonelink driver.  This has to 
+; be done because the Intel linker does not have a start
+; command.
+
+CGROUP 	GROUP	CODE
+DGROUP 	GROUP	DATA
+
+%IF (%MsDOs) THEN (
+PUBLIC  RamEntryPOint
+)FI
+
+%IF (%ForRom) THEN (
+EXTRN	CpGetMySLot: NEAR, CpSetActiveSlot: NEAR
+PUBLIC  MySlotNo
+)FI
+
+CODE	SEGMENT	BYTE PUBLIC 'CODE'
+	ASSUME	CS:CGROUP
+
+EXTRN	EntryPoint: NEAR
+
+$EJECT
+;&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+;
+;   RomEntryPoint
+;
+;   For every driver request, the Os calls RamEntryPoint.  It sets up the
+;   DS and the right ROM bank and calls this routine in ROM without adding
+;   any paramters.  Hence the following is on the stack.
+;
+;   		RamEntryPoint's CS:IP
+;		OSes	BP
+;		OSes	DS
+;		OSes CS:IP
+;		pError
+;		pointer to param List
+;		request
+;
+;   This routine pushes the original three parameters again on the stack &
+;   makes a short call to the plm entrypoint in the phonelink driver.
+;
+;&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+
+RomEntryPoint	PROC	FAR
+
+Parameters	STRUC
+
+RamBP		DW	?		; BP of Ram EntryPOint
+RamRetAddr	DD	?		; Return Address in RamEntryPoint
+%IF (%ForRom) THEN (
+SlotNo		DW	?		; Slot # is saved here by RamEntryPoint
+)FI
+OSBPnDS		DD	?		; OS's  BP & DS
+OsRetAddr	DD	?		; Return Address in OS.
+pError		DD	?		; pointer to error variable.
+pPl		DD	?		; pointer to param list for request.
+request		DW	?		; the request itself.
+
+Parameters	ENDS
+
+; do the usual stuff
+
+	PUSH	BP
+	MOV	BP, SP
+
+; push the original 3 parameters and call the actual entrypoint
+
+	PUSH	WORD PTR SS:[BP].request	; push request
+	PUSH	WORD PTR SS:[BP].pPl+2		; push segment of param list
+	PUSH	WORD PTR SS:[BP].pPl		; push offset of param list
+	PUSH	WORD PTR SS:[BP].pError+2	; push segment of pError
+	PUSH	WORD PTR SS:[BP].pError		; push offset of pError
+
+	CALL	EntryPoint
+
+	POP	BP			; restore RamEntryPoint's BP.
+	RET				; this should be a long return.
+
+RomEntryPoint	ENDP
+
+CODE	ENDS
+
+	PURGE request,pPl,pError,OsRetAddr,OsBPnDS
+
+$EJECT
+DATA	SEGMENT	BYTE PUBLIC 'DATA'
+	ASSUME	CS:DGROUP
+
+%IF (%ForRom) THEN (
+ddInitialize	EQU	0	; copied from Os.Device.Inc
+PhoneLinkRomID	EQU	10	; Unique Rom ID for this version of phonelink.
+
+MySlotNO	DB	?	; Data Seg Vrbl fr saving Phonelink's Slot#
+)FI
+
+;&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+;
+;   RamEntryPoint
+;
+;   For every driver request, the Os calls RamEntryPoint.  Since this is 
+;   in the data segemnt, the CS is what we want for DS.  Setting up DS is
+;   a piece of cake.  Do bank switching to set the ROM containing the 
+;   phonelink ROM, and call RomEntryPoint.  
+;
+;   This routine is placed in the data segement. Hence all the fix-ups 
+;   are in RAM.  The stack at this time contains:
+;	
+;		OSes CS:IP
+;		pError
+;		pointer to param List
+;		request
+;
+;&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+
+
+
+RamEntryPoint		PROC	FAR
+	
+StackParameters	STRUC
+
+OSBPnDS		DD	?		; OS's  BP & DS
+OsRetAddr	DD	?		; Return Address in OS.
+pError		DD	?		; pointer to error variable.
+pPl		DD	?		; pointer to param list for request.
+request		DW	?		; the request itself.
+
+StackParameters	ENDS
+
+	PUSH	DS			; Save OSes DS.
+	PUSH	BP			; Save OSes BP.
+
+; Set up DS for the driver
+
+	MOV	AX,CS			
+	MOV	DS,AX
+
+%IF (%ForRom) THEN (
+;
+; If the request is ddInitialize then find the ROM slot no and save it in a
+; static data segment variable.  It is assumed that ddInitialize will be the
+; very first request.
+;
+	CMP	WORD PTR SS:[BP].request, ddInitialize
+	JNZ	SlotNoIsKnown		
+
+	MOV	AX, PhonelinkRomID	; param for CpGetMySlot
+	PUSH	AX
+
+	CALL	CpGetMySlot		; my slot # will be returned in AL
+
+	MOV	DS:MySLotNo, AL		; save my slot number in DS variable		
+
+;
+; Set the current ROM slot to Phonelink slot, the slot no is 
+; saved in mySlotNo.
+;
+
+SlotNoIsKnown:
+
+	XOR	AX, AX			; clear AH
+	MOV	AL, DS:MySlotNo		; get slot number for phonelink rom
+
+	PUSH	AX	   		; param 1 for CpSetActiveSlot
+	CALL 	CpSetActiveSlot		; set new slot & returns old slot
+	PUSH	AX			; save old slot on stack so that slot
+					; can be restored when request is done.
+)FI
+;
+; Now call rom entrypoint, which knows that the stack contains the original
+; 3 parameters plus whatever is put on stack by RomEntryPoint.
+;
+	CALL    RomEntryPoint		; Make a long call into ROM
+
+%IF (%ForRom) THEN (
+;
+; Restore the current ROM slot to the ROM slot in use when this driver was 
+; called.  The OldSlotNo is already on the stack.
+
+	CALL	CpSetActiveSlot
+)FI
+
+; Now restore OS's environment and return.
+;
+	POP	BP			; save OSes BP
+	POP	DS			; save OSes DS
+	RET	10			; 10 bytes of parameters
+
+RamEntryPoint		ENDP
+
+DATA	ENDS
+
+%IF (%MSDOS) THEN (END) ELSE (END RamEntryPoint)FI

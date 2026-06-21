@@ -1,0 +1,1024 @@
+$TITLE ('Virtual Inter Process Communication Layer')
+$COMPACT 
+$OPTIMIZE(3) SET(vipc1) SET(VipcLayer)
+
+VIPC1: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	This is VIPC. It contains procedures to handle
+&	VIPC functions.
+&
+&	PROCEDURES:
+&
+&		Called from EntryPoint and Vfs2:
+&
+&			VipcSignOn
+&			VipcSignOff
+&			VipcConnect
+&			VipcDisconnect
+&			VipcGetUserInfo
+&			VipcGetLinkStatus
+&			VipcSetStatus
+&			VipcSend
+&			VipcInternalSend
+&			VipcFreeReceiveBuffer
+&			ClearSignal
+&
+&	Author:	Rajendra Shah
+&	Start Date:	3/1/83.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$EJECT
+$SAVE NOLIST
+	/* My favourite Plm literals */
+
+$INCLUDE (``Incs`Plm.Inc~Text~)
+
+	/* Os constants, types and externals */
+
+$INCLUDE (``OsIncs`Os.Error.Inc~Text~)
+$INCLUDE (``Incs`Errors.plm.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Constant.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+
+	/* constants and types */
+
+$INCLUDE (VfsVipc.Constant.Inc~Text~)
+$INCLUDE (VfsVipcConnCB.Type.Inc~Text~)
+$INCLUDE (VfsVipc.Type.Inc~Text~)
+
+	/* externals */
+
+$INCLUDE (Vfs.Ext.Inc~Text~)
+$INCLUDE (vipc.Ext.Inc~Text~)
+$INCLUDE (Dlc.Ext.Inc~Text~)
+$INCLUDE (Twitch.Ext.Inc~Text~)
+
+	/* This is from Cp.MemMgr.Ext.Inc */
+
+/*IntAllocate: PROCEDURE (pid, length, pError) PTR EXTERNAL;
+	DCL pid	PidType;
+	DCL length WORD;
+	DCL pError PTR;
+	END;*/
+
+WMIN: PROCEDURE (a, b) WORD EXTERNAL;
+	DCL (a, b) WORD;
+	END;
+
+$RESTORE
+
+
+$IF debugging
+$SAVE Nolist
+$INCLUDE (Debug.Inc~Text~)
+DCL	DebugMask	WORD	EXTERNAL;
+$RESTORE
+$ENDIF
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VIPC LAYER GLOBAL VARIABLES
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL	VipcLayerState	BYTE PUBLIC INITIAL (VIPC_Lx_Initial);
+
+DCL SignonSemaphore	WORD PUBLIC;	/* semahpore */
+
+DCL pFrameArrived	PTR PUBLIC;	
+		/* this is set to point to resp when a vipc receives
+		one of SignonResp, ConnectResp, DisconnectResp and 
+		others */
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	LOCAL VARIABLES
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL	pSavedUserInfo		PTR,	/* ptr to bfr for saving user info */
+	savedUserInfo		BASED pSavedUserInfo SavedUserInfoType;
+
+DCL	pSavedDataLinkInfo  PTR,	/* ptr to bfr for saving data link info */
+	savedDataLinkInfo	BASED pSavedDataLinkInfo  DataLinkInfoType; 
+DCL	dataLinkInfoLength	WORD;	
+
+DCL NoTimeOutConns		WORD	INITIAL (0);	
+	/* number of connections with activity timeout set to infinity */
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+ClearSignal:
+
+If the expected signal arrives just after OsWait has timed out then the receive
+buffer may remain tied up.  Release the buffer if a signal has arrived in this 
+small window.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ClearSignal: PROCEDURE (semID) CLEAN;
+DCL error WORD;
+DCL note  WORD;
+DCL semID WORD;
+	note = OsWait (semId,
+					0,			/* don't wait at all */
+					@error);
+	IF error = 0 THEN 
+		DO;
+$		IF Debugging
+			DCL msg CharStr ('Signal Found in ClearSignal',cr,lf);
+		CALL ConLineOUt (@msg, size (msg));
+$		ENDIF
+		CALL DlcFreeReceiveBuffer;
+		END;
+END ClearSignal;
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcGetLinkStatus
+&		return in common properties format 
+&			link protocol type and state
+&			link access parameters
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcGetLinkStatus: PROCEDURE (pLength, pBuffer) WORD CLEAN;
+DCL plength 		PTR,
+	length  		BASED pLength WORD;
+
+DCL pBuffer 		PTR,
+	Buffer			BASED pBuffer (1) BYTE;
+
+DCL	linkStatus  	BASED pBuffer STRUCTURE (
+							linkState		WORD,
+							protocolType	BYTE,
+							protocolVersion	BYTE);
+		
+DCL returnLength	WORD;
+DCL xfrLength		WORD;
+
+DCL GRiDLinkProtocol					LIT	'1',
+	PhonelinkAnswerProtocol				LIT	'2',
+	PhonelinkOriginateProtocol			LIT '3';
+
+	IF (VipcLayerState <> VIPC_Lx_Running) 
+		AND (VipcLayerState <> Vipc_Lx_Ready) 
+		THEN RETURN (eUserNotSignedOn);
+
+	returnLength = 0;
+	IF length >= size (linkStatus) THEN 
+		DO;
+		IF VipcLayerState = VIPC_Lx_Running 
+			THEN linkStatus.linkState = 0;
+			ELSE linkStatus.linkState = reasonForDataLinkDeath;
+		linkStatus.protocolVersion = 1;		/* Protocol version on 8/14/85 */
+		IF Phonelink 
+			THEN linkStatus.protocolType = phonelinkOriginateProtocol;
+			ELSE linkStatus.protocolType = GRiDLinkProtocol;
+		returnLength = size (linkStatus);
+
+		IF phonelink THEN 
+			DO;
+			xfrLength = WMIN (dataLinkInfoLength, length - SIZE(linkStatus));
+			CALL MOVB (@savedDataLinkInfo, @buffer (SIZE(linkStatus)),
+									 xfrLength);
+			returnLength = returnLength + xfrLength;
+			END;
+		END;
+	length = returnLength;
+	RETURN (0);
+END VipcGetLinkStatus;
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcGetUserInfo
+&	A very simple routine. Return a copy of saved user info.  
+&	May be the password property should be cleared ??
+&	
+&	set length to min of length provided and user info length.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcGetUserInfo: PROCEDURE (pLength, pBuffer) WORD CLEAN;
+DCL plength 	PTR,
+	length  	BASED pLength WORD;
+
+DCL pBuffer 	PTR,
+	Buffer		BASED pBuffer (1) BYTE;
+		
+DCL index		BYTE;
+DCL pProperty 	PTR,
+	property  	BASED pProperty STRUCTURE (
+							propertyType  	BYTE,
+							propertyLen		BYTE,
+							propertyValue	(1) BYTE);
+
+DCL userPasswordProp         LIT '10';
+
+	IF (VipcLayerState <> VIPC_Lx_Running) 
+		AND (VipcLayerState <> Vipc_Lx_Ready) 
+		THEN RETURN (eUserNotSignedOn);
+
+	IF length > savedUserInfo.TotalLength 
+		THEN length = savedUserInfo.TotalLength;
+	CALL MOVB (@SavedUserInfo.FirstProperty, pBuffer, length);
+
+	/* Now make the password field null */
+	index = 0;
+	DO WHILE index < length;
+		pProperty = @buffer (index);
+		IF property.propertyTYpe = userPasswordProp
+			THEN CALL SETB ('X', @property.propertyValue, property.propertyLen);
+		index = index + 2 + property.propertyLen;
+		END; /* while */
+		
+	RETURN (0);
+END VipcGetUserInfo;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcInternalSignON
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcInternalSignON: PROCEDURE WORD CLEAN;
+	DCL	(note, error)		WORD;
+	DCL VipcSignonHeader	VipcSignonHeaderType;
+	DCl VipcSignonResponse	BASED pFrameArrived	VipcSignonResponseType;
+
+	DCL error1				WORD;
+	DCL twitchState			DWORD;
+
+		/* Start the data link */
+
+$IF Debugging
+	DCL msg CharStr ('Starting Data Link...',cr,lf);
+	IF MajorEvents2MaskSet THEN CALL COnLineOut (@msg, size (msg));
+	twitchState = TurnTwitchOn;
+	error = DlcStart (pSavedDataLinkInfo);
+	CALL TurnTwitchOff (twitchState);
+	IF MajorEvents2MaskSet THEN
+		DO;
+		DCL msg CharStr ('Data Link Started:');
+		CALL COnLineOut (@msg, size (msg));
+		CALL HexOut (error);
+		CALL Newline;
+		END;
+
+	IF error <> 0 THEN RETURN (error);
+	
+$ELSE
+	IF Phonelink THEN error = DlcStart (pSavedDataLinkInfo);
+	ELSE 
+		DO;
+		twitchState = TurnTwitchOn;
+		error = DlcStart (pSavedDataLinkInfo);
+		CALL TurnTwitchOff (twitchState);
+		END;
+
+	IF error <> 0 THEN RETURN (error);
+$ENDIF
+
+		/* Construct Vipc Header and rest of frame and 
+		send the request to remote server system */
+
+	SignonSemaphore = OsCreateSemaphore (@error);
+	IF error = 0 THEN 
+		DO;
+		VipcSignonHeader.VipcFunctionCode = VIPC_Px_Signon;
+		VipcSignonHeader.propertyType = VersionType;
+		VipcSignonHeader.LenNValue = 0101H;	
+				/* filling in two fields at a time */
+		
+		vipcLayerState = VIPC_Lx_SignonSent;
+		error = DlcWrite (
+					SIZE (VipcSignonHeader), 
+					@VipcSignonHeader,
+					savedUserInfo.TotalLength,
+					@savedUserInfo.firstProperty,
+					FALSE);
+
+		IF error = 0 THEN
+			DO;	/* Now wait for signon response */
+			twitchState = TurnTwitchOn;
+$IF oldCode
+			note = OsWait (signOnSemaphore, VipcResponseTimeOut, @error);
+			CALL TurnTwitchOff (twitchState);
+	
+			IF error = eTimeout THEN
+				DO;
+				vipcLayerState = VIPC_Lx_Initial;
+				CALL ClearSignal (signOnSemaphore);
+				END;
+$ELSE
+			note = OsWait (signOnSemaphore, NULLWORD, @error);
+			CALL TurnTwitchOff (twitchState);
+$ENDIF
+			IF error = 0 THEN error = note;
+			IF error = 0 THEN
+				DO;
+					/* pFrameArrived now points to Received buffer */
+				IF (error := VipcSignonResponse.SignonStatus) <> 0 
+			    	THEN CALL DlcFreeReceiveBuffer;
+				END;
+			END;
+		CALL OsDeleteSemaphore (SignonSemaphore, @error1);
+		END;
+
+	RETURN (error);
+END VipcInternalSignOn;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	FreeUserInfo
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FreeUserInfo: PROCEDURE (nextState) REENTRANT;
+DCL nextState	WORD;
+DCL error1 		WORD;
+	vipcLayerState = nextState;
+	CALL OsFree (pSavedUserInfo, @error1);
+$	IF Debugging
+	IF error1 <> 0 THEN
+		DO;
+			DCL msg CharStr ('Error in OsFree: ');
+		CALL ConLineOut (@msg, size(msg));
+		CALL ConHexOut (error1);
+		CALL ConLineOUt (@(cr,lf), 2);
+		END;
+$	ENDIF
+	IF Phonelink THEN 
+		DO;
+		CALL OsFree (pSavedDataLinkInfo, @error1);
+$		IF Debugging
+		IF error1 <> 0 THEN
+			DO;
+			DCL msg CharStr ('Error in OsFree: ');
+			CALL ConLineOut (@msg, size(msg));
+			CALL ConHexOut (error1);
+			CALL ConLineOUt (@(cr,lf), 2);
+			END;
+$		ENDIF
+		END;
+END FreeUserInfo;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcSignON
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcSignON: PROCEDURE (plength, pUserInfo, pDataLinkInfo) WORD CLEAN;
+	DCL	pLength				PTR,
+		length				BASED pLength WORD;
+
+	DCL	pUserInfo			PTR;
+	DCL pDataLinkInfo		PTR,
+		dataLinkInfo		BASED pDataLinkInfo	DataLinkInfoType;
+
+	DCL	error				WORD;
+	DCl VipcSignonResponse	BASED pFrameArrived	VipcSignonResponseType;
+
+
+$IF Debugging
+	DCL msg CharStr ('SignON',cr,lf);
+	IF MajorEventsMaskSet THEN CALL ConLineOut (@msg, size(msg));
+$ENDIF
+
+	IF vipcLayerState <> Vipc_Lx_Initial THEN
+		DO;
+		error = eUserAlreadySignedOn;
+		GOTO SignOnExit;
+		END;
+
+	/* Save User information for use during auto re-signon. */
+
+	pSavedUserInfo = IntAllocate (0, length+2, @Error);
+	IF error <> 0 THEN GOTO SignonExit;
+
+	savedUserInfo.TotalLength = length;	/* allocated length+2 for this field */
+	CALL MOVB (pUserInfo, @SavedUserInfo.FirstProperty, length);
+
+	IF PhoneLink THEN
+		DO;
+		dataLinkInfoLength = dataLinkInfo.phoneNumberLen 
+									+ (SIZE(dataLinkInfo) - 1) + 2;
+		/* Save data link information for use during auto re-signon. */
+		pSavedDataLinkInfo = IntAllocate (0, dataLinkInfoLength, @error);
+		IF error <> 0 THEN GOTO SignonExit;
+
+		CALL MOVB (pDataLinkInfo, pSavedDataLinkInfo, dataLinkInfoLength);
+		END;
+	ELSE pSavedDataLinkInfo = NULLPTR;
+
+		/* Start the data link */
+
+	IF (error := VipcInternalSignOn) = 0 THEN 
+		DO;
+			/* pFrameArrived now points to Received buffer */
+
+		length = VipcSignonResponse.serverNameLen;
+		CALL MOVB (@VipcSignonResponse.serverNameLen, 
+						pUserInfo, 
+						length+1);
+
+				/* Signon is successful, change VIPC state */
+
+		vipcLayerState = VIPC_Lx_Running;
+		CALL DlcFreeReceiveBuffer;
+		END;
+
+	ELSE CALL FreeUserInfo (VIPC_Lx_Initial);
+
+SignOnExit:
+
+$IF Debugging
+	IF MajorEventsMaskSet THEN 
+		DO;
+		DCL msg CharStr ('SignON Complete:');
+		CALL ConLineOut (@msg, size (msg)); 
+		CALL Hexout (error);
+		CALL NewLine;
+		IF SingleStepMaskSet THEN CALL PrintTimings;
+		END;
+
+$ENDIF
+	RETURN (error);
+END VipcSignOn;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcSignOFF
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcSignOFF: PROCEDURE WORD CLEAN;
+	DCL error			WORD;
+	DCL error1			WORD;
+	DCL VipcSignoff		VipcSignoffType;
+
+
+$IF Debugging
+	IF MajorEventsMaskSet THEN 
+		CALL ConLineOut (@('SignOff',cr,lf), 9);
+$ENDIF
+	
+	/* change the state to Idle. You cannot sign-on any more.  the driver has to
+	be removed from memory.  This is done so that if after signoff the driver
+	is kept in memory for open connections, it prevents sign-ons */
+
+	IF (VipcLayerState = VIPC_Lx_Ready) THEN CALL FreeUserInfo (VIPC_Lx_Idle);
+	ELSE IF VipcLayerState = VIPC_Lx_Running THEN
+		DO;
+		CALL FreeUserInfo (VIPC_Lx_Idle);
+
+		/* Simply Send a SignOff frame, stop the data link and exit */
+		VipcSignOff.vipcFunctionCode = VIPC_Px_SignOff;
+	
+		error = DlcWrite (
+				SIZE (VipcSignOff), 
+				@VipcSignOff,
+				0,
+				0ffffh,
+				TRUE);	/* come back only after it is sent */
+$IF Debugging
+		IF MajorEventsMaskSet THEN 
+			DO;
+			CALL ConLineOut (@('Disconnecting Data Link',cr,lf), 25);
+			END;
+$ENDIF
+		CALL DlcStop (eUserNotSignedOn);
+		END;
+
+$IF Debugging
+	IF MajorEventsMaskSet THEN 
+		DO;
+		DCL msg Charstr ('SignOFF Complete',cr,lf);
+		CALL ConLineOut (@msg, size (msg));
+		IF SingleStepMaskSet THEN CALL PrintTimings;
+		END;
+$ENDIF
+	RETURN (0);
+END VipcSignOFF;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcConnect
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcConnect: PROCEDURE (sVipcConnCB, pPathName) WORD CLEAN;
+	DCL sVipcConnCB			SELECTOR,
+		vipcConnID			WORD	AT (@sVipcConnCB),
+		vipcConnCB			BASED	sVipcConnCB	VipcConnCBType;
+
+	DCL	pPathName			PTR,
+		pathName			BASED pPathName				PathNameType;
+
+	DCL (note, error)		WORD;
+	DCL error1				WORD;
+		
+	DCL vipcConnectHeader	VipcConnectHeaderType;
+	DCL vipcConnectResponse BASED pFrameArrived		VipcConnectResponseType;
+
+	DCL twitchState			DWORD;
+
+	error = 0;
+	IF vipcLayerState <> VIPC_Lx_Running THEN
+		DO;
+		IF vipcLayerState = VIPC_Lx_Ready THEN
+			DO;
+$IF Debugging
+			IF MajorEventsMaskSet THEN 
+				CALL ConLineOut (@(cr,lf,'Auto SignON',cr,lf), 15);
+$ENDIF
+			IF (error := VipcInternalSignon) = 0 THEN 
+            	DO;
+				VipcLayerState = VIPC_Lx_Running;
+				CALL DlcFreeReceiveBuffer;
+				END;
+			ELSE vipcLayerState = VIPC_Lx_Ready;
+
+$IF Debugging
+			IF MajorEventsMaskSet THEN 
+				DO;
+				CALL ConLineOut (@('SignON Complete:'), 16);
+				CALL Hexout (error);
+				CALL NewLine;
+				END;
+$ENDIF
+			END;
+		ELSE RETURN (eUserNotSignedON);
+		END;
+
+$IF Debugging
+	IF VipcMaskSet THEN 
+		DO;
+		CALL ConLineOut (@('    Connect: '), 13);
+		CALL ConLineOut (@pathName.chars, pathname.length);
+		CALL HexOut (vipcConnID);
+		CALL NewLine;
+		END;
+	IF TimingMaskSet THEN CALL SetStartTime;
+$ENDIF
+
+	IF error <> 0 THEN RETURN (error);
+	
+	vipcConnCB.respReceived = OsCreateSemaphore (@error);
+	IF error = 0 THEN vipcConnCB.inUseSema = OsCreateSemaphore (@error);
+	IF error = 0 THEN
+		DO;
+		IF (error := AddVipcConnIDToList (vipcConnID)) = 0 THEN
+			DO;
+
+			vipcConnectHeader.vipcFunctionCode = VIPC_Px_Connect;
+			vipcConnectHeader.localPathID = vipcConnID;
+			vipcConnectHeader.remotePathID = 0;
+	
+			vipcConnCB.connState = VIPC_Cx_ConnectSent;
+			
+			error = DlcWrite (SIZE (VipcConnectHeader), 
+						@VipcConnectHeader,
+						pathName.length + 1,
+						pPathName,
+						FALSE);			/* asynchronous */ 
+
+			IF error = 0 THEN
+				DO;  /* wait for connect response */
+
+				twitchState = TurnTwitchOn;
+$IF oldCode
+				note = OsWait (vipcConnCB.respReceived, 
+							VipcResponseTimeOut, 
+							@error);
+				CALL TurnTwitchOff (twitchState);
+
+				IF error = eTimeOut THEN
+					DO;
+					vipcConnCB.connState = Vipc_Cx_Disconnected;
+					CALL ClearSignal (vipcConnCB.respReceived);
+					END;
+$ELSE
+				note = OsWait (vipcConnCB.respReceived, NULLWORD, @error);
+				CALL TurnTwitchOff (twitchState);
+$ENDIF
+
+				IF error = 0 THEN error = note;
+				IF error = 0 THEN
+					DO;
+					/* pFrameArrived now points to Received buffer */
+
+					IF (error := VipcConnectResponse.ConnectStatus) = 0 THEN 
+						DO;
+						vipcConnCB.connState = VIPC_Cx_connected;
+						vipcConnCB.remotePathID 
+								= vipcConnectResponse.localPathID;
+						vipcConnCB.clientProcessID = OsWhoAmI;
+						vipcConnCB.activityTimeOut = 0;	/* defalut */
+						CALL OsSignal (vipcConnCB.inUseSema, signalNormal,
+											0, @error);
+						END;
+
+					CALL DlcFreeReceiveBuffer;
+					END;
+				END;
+			IF error <> 0 THEN 
+		    	DO;
+				CALL GetBigvipcLock;
+				CALL DeleteVipcConnIDFromList (vipcConnID);
+				CALL ReleaseBigVipcLock;
+				END;
+			END;
+		IF error <> 0 THEN
+			DO;
+			CALL OsDeleteSemaphore (vipcConnCB.inUseSema, @error1);
+			CALL OsDeleteSemaphore (vipcConnCB.respReceived, @error1);
+			END;
+		END;
+
+$IF Debugging
+
+	IF TimingMaskSet THEN CALL SetStopTime;
+
+	IF VipcMaskSet THEN 
+		DO;
+		CALL ConLineOut (@('    Connect Complete:'), 21);
+		CALL ConHexOut (error);
+		CALL NewLine;
+		IF SingleStepMaskSet THEN CALL PrintTimings;
+		END;
+
+$ENDIF
+	RETURN (error);
+END VipcConnect;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcDisConnect
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcDisConnect: PROCEDURE (sVipcConnCB) WORD CLEAN;
+	DCL sVipcConnCB		SELECTOR,
+		vipcConnID		WORD	AT	(@sVipcConnCB),
+		vipcConnCB		BASED	sVipcConnCB	VipcConnCBType;
+
+	DCL (note, error)	WORD;
+	DCL error1			WORD;
+
+	DCL vipcDiscReq		VipcDiscReqType;
+	DCL vipcDiscResp	BASED pFrameArrived VipcDiscRespType;
+
+	DCL twitchState		DWORD;
+
+	error = 0;
+
+$IF Debugging
+	IF VipcMaskSet THEN 
+		DO;
+		CALL ConLineOut (@('    DisConnect:'), 15);
+		CALL HexOut (vipcConnID);
+		CALL NewLine;
+		END;
+
+	IF TimingMaskSet THEN CALL SetStartTime;
+
+	IF NOT validVipcCOnnection (vipcConnID) THEN
+		DO;
+		DCL msg CharStr ('Invalid VipcConnection:');
+		CALL conlineout (@msg, size(msg));
+		CALL Hexout (vipcConnID);
+		CALL newline;
+		RETURN (eBadConn);
+		END;
+$ENDIF
+
+	IF vipcConnCB.connState <> VIPC_Cx_DisConnected THEN 
+		DO;
+		vipcDiscReq.vipcFunctionCode = VIPC_Px_DisConnect;
+		vipcDiscReq.localPathID = vipcConnID;
+		vipcDiscReq.remotePathID = vipcConnCB.remotePathID;
+		vipcConnCB.connState = VIPC_Cx_DisconnectSent;
+
+		error = DlcWrite (SIZE (VipcDiscReq), @VipcDiscReq, 0, 0ffffh, FALSE);
+		IF error = 0 THEN
+			DO;	/* wait for Disconnect response */
+			twitchState = TurnTwitchOn;
+			note = OsWait (vipcConnCB.respReceived, VipcResponseTimeOut,@error);
+			CALL TurnTwitchOff (twitchState);
+			END;
+
+		vipcConnCB.connState = Vipc_Cx_Disconnected;
+		IF error = eTimeOut THEN CALL ClearSignal (vipcConnCB.respReceived);
+		IF error = 0 THEN error = note;
+		IF error = 0 THEN CALL DlcFreeReceiveBuffer;
+
+		CALL OsDeleteSemaphore (vipcConnCB.respReceived, @error1);
+		CALL OsDeleteSemaphore (vipcConnCB.inUseSema, @error1);
+		IF phonelink AND (vipcCOnnCB.activityTimeout = 0ffh) 
+			THEN CALL VipcEnableActivityTimeOut;
+		END;
+
+	CALL GetBigVipcLock;
+	CALL DeleteVipcConnIDFromList (vipcConnID);
+	CALL ReleaseBigVipcLock;
+
+$IF Debugging
+	IF TimingMaskSet THEN CALL SetStopTime;
+	IF VipcMaskSet THEN 
+		DO;
+		DCL msg CharStr ('    DisConnect Complete:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL ConHexOut (error);
+		CALL NewLine;
+		IF SingleStepMaskSet THEN CALL PrintTimings;
+		END;
+
+$ENDIF
+	RETURN (error);
+END VipcDisConnect;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcSetStatus
+&
+&	Currently the only SetStatus call implemented on compass
+&	IPC is that of setting timeouts on IPC connections.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcSetStatus: PROCEDURE (sVipcConnCB, pStsBuffer, length) WORD CLEAN;
+	DCL sVipcConnCB		SELECTOR,
+		VipcConnID		WORD 	AT (@sVipcCOnnCB),
+		VipcConnCB		BASED 	sVipcConnCB VipcConnCBType;
+	
+	DCL	pstsBuffer		PTR,
+		stsBuffer		BASED pstsBuffer (1) BYTE;
+
+	DCL error			WORD;
+	DCL length			WORD;
+	DCL j				WORD;
+	DCL k				WORD;
+	DCL partialWildCard	BOOLEAN;
+	
+	DCL pSetStatusEntry	PTR,
+		setStatusEntry	BASED pSetStatusEntry SetStatusEntryType;
+		
+	j = 0;
+	DO WHILE J < length;
+		pSetStatusEntry = @stsBuffer (j);
+		IF setStatusEntry.entryID = setIPCActivityTimeOut THEN
+			DO;
+			/* For GRiDLink this is a no-op */
+			IF Phonelink AND
+				(setStatusEntry.statusData (0) <> vipcCOnnCB.activityTImeout) 
+			THEN DO;
+				IF setStatusEntry.statusData (0) = 0 
+					THEN CALL VipcEnableActivityTimeOut;
+				ELSE IF setStatusEntry.statusData (0) = 0ffh 
+					THEN CALL VipcDisableActivityTimeout;
+				ELSE RETURN (eNotSupport);
+				vipcConnCB.activityTimeout = setStatusEntry.statusData (0);
+				END;
+			END;
+		ELSE RETURN (eNotSupport);
+
+		j = j + setStatusEntry.length + (size (setstatusEntry) - 1);
+		END;
+	RETURN (0);
+END VipcSetStatus;
+
+
+$IF outdated
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DisconnectUnusedConnection
+&
+&	Try to fine a vipc connection which was created by vfs but has no files
+&   open on it now.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DisconnectUnusedConnection: PROCEDURE REENTRANT;
+	DCL i 				WORD;
+	DCL vipcConnID		WORD,
+	 	sVipcConnCB		SELECTOR	AT	(@vipcConnID),
+		vipcConnCB		BASED		sVipcConnCB	VipcConnCBType;
+	DCL error1			WORD;
+
+	CALL GetBigVipcLock;
+	DO i = 0 TO VipcConnections-1;
+		vipcConnID = connectionList (i);
+		IF (vipcConnCB.clientIsVfs) AND (vipcConnCB.vfsConnections = 0) THEN
+			DO;
+			CALL VfsResetVipcConnForDevice (vipcConnID);
+			CALL ReleaseBigVipcLock;
+			error1 = VipcDisconnect (sVipcConnCB);
+			CALL OsFree (BUILD$PTR (sVipcConnCB,0), @error1);
+$			IF Debugging
+			IF error1 <> 0 THEN
+				DO;
+					DCL msg CharStr ('Error in OsFree:');
+				CALL ConLineOut (@msg, size(msg));
+				CALL HexOut (error1);
+				CALL Newline;
+				END;
+$			ENDIF
+			RETURN;
+			END;
+		END;
+
+	/* Did not find any vipc connections on which no files are open */
+
+	CALL ReleaseBigVipcLock;
+END DisconnectUnusedConnection;
+$ENDIF
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcInternalSend:  used by Vfs
+&
+&	when called by VipcSend header is the VipcHeader.  Whenc called by vfs
+&	the header is vipc + vfs header.
+&
+&	This routine fills in the following vipc header fields:
+&
+&		functionCode, localPathID, remotePathID, vipcDataDength.  
+&
+&	Rest of the fields must be filled in by the caller.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcInternalSend: PROCEDURE (vipcConnID, headerLen, pHeader, bufferLen, pBuffer) 
+						WORD CLEAN;
+
+	DCL vipcConnID			WORD,
+		sVipcConnCB			SELECTOR AT (@vipcConnID),
+		vipcConnCB			BASED sVipcConnCB			VipcConnCBType;
+
+	DCL headerLen			WORD, 
+		bufferLen			WORD;
+	DCL pHeader				PTR,
+		pBuffer				PTR;
+
+	DCL error				WORD;
+
+	DCL vipcMessageHeader	Based pHeader VipcMessageHeaderType;
+
+	/* If vipc layer is not running then 
+	cannot send message */
+
+	IF vipcConnCB.connState <> VIPC_Cx_Connected 
+		THEN RETURN (vipcConnCB.reasonForDisconnect);
+
+$IF Debugging
+	IF NOT validVipcCOnnection (vipcConnID) THEN
+		DO;
+		DCL msg CharStr ('Invalid VipcConnection:');
+		CALL conlineout (@msg, size(msg));
+		CALL Hexout (vipcConnID);
+		CALL newline;
+		RETURN (eBadConn);
+		END;
+$ENDIF
+
+	/* Prepare the header and send the message */
+
+	vipcMessageHeader.vipcFunctionCode = VIPC_Px_Msg;
+	vipcMessageHeader.localPathID  = vipcConnID;
+	vipcMessageHeader.remotePathID = vipcConnCB.remotePathID;
+	vipcMessageHeader.vipcDataLength = bufferLen + headerLen 
+										- SIZE (VipcMessageHeader);
+	error = DlcWrite (
+				headerLen, 
+				pHeader,
+				bufferLen,
+				pBuffer,
+				FALSE);			/* Asynchronous */
+
+$IF Debugging
+	IF VipcMsgMaskSet THEN 
+		DO;
+		IF error = 0 THEN
+			DO;
+			DCL msg CharStr ('    Msg Sent, CID/cl/nt/ln: ');
+			CALL ConLineOut (@msg, size(msg));
+			CALL HexOut (vipcConnID);
+			CALL HexOut (vipcMessageHeader.class);
+			CALL HexOut (vipcMessageHeader.note);
+			CALL HexOut (vipcMessageHeader.vipcDataLength);
+			CALL NewLine;
+			END;
+		ELSE
+			DO;
+			DCL msg CharStr ('    Error in Int Send:');
+			CALL ConLineOut (@msg, size(msg));
+			CALL Hexout (error);
+			CALL newline;
+			END;
+		END;
+$ENDIF
+
+	RETURN (error);
+
+END VipcInternalSend;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcSend:  
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcSend: PROCEDURE (vipcConnID, class, note, pVipcUserMsg) WORD CLEAN;
+
+	DCL vipcConnID			WORD,
+		sVipcConnCB			SELECTOR AT (@vipcConnID),
+		vipcConnCB			BASED sVipcConnCB			VipcConnCBType;
+
+	DCL (class, note) 		WORD;
+
+	DCL	pVipcUserMsg		PTR,
+		VipcUserMsg			BASED pVipcUserMsg VipcIfMsgType;
+
+	DCL vipcMessageHeader	VipcMessageHeaderType;
+	DCL error				WORD;
+	DCL error1				WORD;
+
+		/* If vipc layer is not running 
+		then cannot send message */
+
+	IF vipcConnCB.connState <> VIPC_Cx_Connected 
+		THEN RETURN (vipcConnCB.reasonForDisconnect);
+
+$IF Debugging
+	IF NOT validVipcCOnnection (vipcConnID) THEN
+		DO;
+		DCL msg CharStr ('Invalid VipcConnection:');
+		CALL conlineout (@msg, size(msg));
+		CALL Hexout (vipcConnID);
+		CALL newline;
+		RETURN (eBadConn);
+		END;
+$ENDIF
+
+	/* Check buffer length */
+
+	If VipcUserMsg.VipcDataLength > maxVipcMsgLength 
+		THEN RETURN (eMessageTooLong);
+
+		/* Prepare the header and send the message */
+
+	vipcMessageHeader.vipcFunctionCode = VIPC_Px_Msg;
+	vipcMessageHeader.localPathID  = vipcConnID;
+	vipcMessageHeader.remotePathID = vipcConnCB.remotePathID;
+	vipcMessageHeader.class = class;
+	vipcMessageHeader.note = note;
+
+	IF pVipcUserMsg = NULLPTR 
+	   THEN vipcMessageHeader.vipcDataLength = 0;
+	   ELSE vipcMessageHeader.vipcDataLength = vipcUserMsg.vipcDataLength;
+
+	error = DlcWrite (SIZE (VipcMessageHeader),
+					@VipcMessageHeader,
+	 				VipcMessageHeader.VipcDataLength,
+					@VipcUserMsg.DataArea,	
+		             	/* this will be junk for null messages */
+					TRUE);		/* Synchronous */
+
+	IF error = 0 THEN IF VipcUserMsg.toBeFreed THEN
+		DO;
+		CALL OsFree (@vipcUserMsg, @error1);
+$		IF Debugging
+		IF error1 <> 0 THEN
+			DO;
+				DCL msg CharStr ('Error in OsFree:');
+			CALL ConLineOut (@msg, size(msg));
+			CALL HexOut (error1);
+			CALL Newline;
+			END;
+$		ENDIF
+		END;
+
+$IF Debugging
+	IF VipcMsgMaskSet THEN 
+		DO;
+		CALL ConLineOut (@('    Msg Sent, CID/cl/nt/ln: '), 28);
+		CALL HexOut (vipcConnID);
+		CALL HexOut (vipcUserMsg.class);
+		CALL HexOut (vipcUserMsg.note);
+		CALL HexOut (vipcUserMsg.vipcDataLength);
+		CALL NewLine;
+		END;
+$ENDIF
+
+	RETURN (error);
+END VipcSend;
+
+
+
+VipcFreeReceiveBuffer: PROCEDURE CLEAN;
+	CALL DlcFreeReceiveBuffer;
+END VipcFreeReceiveBuffer;
+
+END VIPC1;	/* module */
+

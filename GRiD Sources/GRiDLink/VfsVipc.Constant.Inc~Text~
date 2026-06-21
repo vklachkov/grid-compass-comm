@@ -1,0 +1,190 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsVipc.constant.Inc
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/* Vipc Protocol Function Codes */
+
+DCL	VIPC_Px_Msg					AS	'0',
+	VIPC_Px_Connect				AS	'1',
+	VIPC_Px_ConnectResponse		AS	'2',
+	VIPC_Px_Disconnect			AS	'3',
+	VIPC_Px_DisconnectResponse	AS	'4',
+	VIPC_Px_Signon				AS	'19',
+	VIPC_Px_SignonResponse		AS	'6',
+	VIPC_Px_Signoff				AS	'7',
+	VIPC_Px_Error				AS	'100';
+
+/* Vipc Interface Function Codes */
+
+DCL VIPC_Ix_Msg					AS	'0',
+	VIPC_Ix_MsgArrived			AS	'0',
+
+	VIPC_Ix_ConnectRequest		AS	'1',	/* Client Layer to VIPC */
+	VIPC_Ix_ConnectConfirm		AS	'2',	/* response from VIPC */
+
+	VIPC_Ix_ConnectArrived		AS	'3',	/* VIPC to client layer */
+	VIPC_Ix_ConnectResponse		AS	'4',	/* response from Client layer */
+
+	VIPC_Ix_DisconnectRequest	AS	'5',	/* Client Layer to VIPC */
+	VIPC_Ix_DisConnectConfirm	AS	'6',	/* response from VIPC */
+
+	VIPC_Ix_DisconnectArrived	AS	'7',	/* VIPC to client layer */
+	VIPC_Ix_DisconnectResponse	AS	'8',	/* response from Client layer */
+
+	VIPC_Ix_SignonRequest		AS	'9',	/* Client layer  to VIPC */
+	VIPC_Ix_SignonResponse		AS	'10',	/* response from VIPC */
+
+	VIPC_Ix_ValidateUser		AS	'11',	/* VIPC to Admin */
+	VIPC_Ix_ValidateResponse	AS	'12',	/* Response from admin */
+
+	VIPC_Ix_Error				AS	'100';
+$EJ
+/* Vipc Layer State Machine States */
+
+DCL	VIPC_Lx_Initial				AS	'0',
+	VIPC_Lx_SignonSent			AS	'1',
+	VIPC_Lx_SignonRcvd			AS	'2',
+	VIPC_Lx_Running				AS	'3',
+	VIPC_Lx_AutoSignon			AS	'4',
+	VIPC_Lx_Ready				AS	'5',
+	VIPC_Lx_Idle				AS	'6';
+
+
+/* Vipc Connection State Machine States */
+
+DCL	VIPC_Cx_Disconnected		AS	'0',
+	VIPC_Cx_ConnectSent			AS	'1',
+	VIPC_Cx_ConnectRcvd			AS	'2',
+	VIPC_Cx_Connected			AS	'3',
+	VIPC_Cx_DisconnectSent		AS	'4',
+	VIPC_Cx_DisconnectRcvd		AS	'5';
+
+
+/* Vipc and DLC Interface events */
+
+DCL
+	DLC_Ex_Started				AS	'1',
+    DLC_Ex_Disconnected			AS	'2',
+	DLC_Ex_IdlePollTwitch		AS	'3',
+	DLC_Ex_ActivityTimeOUt		AS	'4',
+	DLC_Ex_FrameArrived			AS	'5',
+	DLC_Ex_PrintDlcMsg			AS	'6';
+
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	constants for Vfs layer.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/* constants for the standard file system requests
+are defined in Os.Device.Inc and hence are included here
+only as comments.  Additional non-standard constants for
+Vfs use are defined here */
+
+/*    Request codes:
+
+DCL ddInitialize 		LIT '0';
+DCL ddGetStatus 		LIT '1';
+DCL ddOpen 				LIT '2';
+DCL ddClose 			LIT '3';
+DCL ddRead 				LIT '4';
+DCL ddWrite 			LIT '5';
+DCL ddSeek 				LIT '6';
+DCL ddTruncate 			LIT '7';
+DCL ddAttach 			LIT '8';
+DCL ddDetach 			LIT '9';
+DCL ddRename 			LIT '10';
+DCL ddDelete 			LIT '11';
+DCL ddReadDesc 			LIT '12';
+DCL ddWriteDesc 		LIT '13';
+DCL ddFlush 			LIT '14';
+DCL ddWaitSRQ 			LIT '15';
+DCL ddSelfTest 			LIT '16';
+DCL ddFormat 			LIT '17';
+DCL ddSetStatus 		LIT '20';
+DCL ddDeactivate 		LIT '21';
+
+DCL ddTrackFormat 		LIT '22';
+DCL ddControllerTest 	LIT '23';
+DCL ddRamTest 			LIT '24';
+DCL ddDriveTest 		LIT '25';
+DCL ddProg 				LIT '26';
+DCL ddWriteProtect 		LIT '27';
+DCL ddBufferCommand 	LIT '28';
+
+DCL ddFlushBitMaps 		LIT '23';
+
+DCL
+	ddReadDirPage		LIT	'29',
+	ddSignon			LIT	'30',
+	ddSignOff			LIT	'31',
+	ddSend				LIT	'32',
+	ddRemoteCopy		LIT '33';
+
+*/
+
+/* 30000 - 30499: VFS layer requests all passed through by VfsLink in
+write request format */
+/* 30500 - 30999: Additional VFS layer requests */
+
+DCL ddVfsLayerMinCall		LIT '30000';
+DCL ddVfsLayerMaxCall		LIT '30449';
+
+DCL ddChangeUserContext		LIT	'30000';
+
+/* Used for MsDos Interceptor */
+
+DCL ddAddVfsDevice		AS	'31000';
+DCL ddGetVfsDevice		AS	'31001';
+DCL ddSetServerName		AS	'31002';
+DCL ddGetServerName		AS  '31003';
+DCL ddSetPrinterAlias	AS	'31004';
+DCL ddGetPrinterAlias	AS	'31005';
+DCL ddRestoreInterrupts	AS	'31006';
+
+/* Used for specialized calls to gridlink & phonelink drivers */
+
+DCL ddGetuserInfo		AS	'32000';
+DCL ddReadDlcCounters	AS	'32001';
+DCL ddSetDebugMask		AS	'32002';
+DCL ddGetLinkStatus		AS	'32003';
+
+DCL ProcessConnectMode	LIT '10';
+
+
+
+$IF Debugging
+$IF notusedanymore
+zzz
+DCL	ddSendFrame			LIT	'100',		/* 64h */
+	ddReceiveFrame		LIT	'101',		/* 65h */
+	ddToggleDebugMask	LIT '100h',
+	ddSetDebugMask		LIT	'101h',
+	ddSetClockSpeed		LIT	'102h',
+	ddPrintErrorCnts	LIT	'103h',
+	ddShowStack			LIT	'104h';
+$ENDIF
+$ENDIF
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Miscellaneous
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL maxVipcMsgLength			AS	'514';		/* This happens to be the max
+												VFS response size */
+DCL VipcResponseTimeOut			AS 	'60000';	/* in ms it is 60 seconds */
+DCL VfsResponseTimeout			AS	'600';		/* in seconds, it is 10 min */
+
+DCL PageSize					AS 	'504';
+
+DCL maxDirObjectsPerPage		AS	'30';
+
+DCL VIPC_Function_Class			AS	'65000',
+	VfsClass					AS	'83';
+
+DCL VersionType					AS 	'33';
+
+DCL IpcHeaderLength				LIT	'16';
+DCL MaxVipcMessageLength		LIT '514';
+DCL MaxVipcBufferLength			LIT	'530';

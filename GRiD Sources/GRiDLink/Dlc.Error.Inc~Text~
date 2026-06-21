@@ -1,0 +1,80 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Error Constants
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE		/* error codes returned by Read routines */
+	eNoError				LIT '0',
+
+	/* The order and the number of following errors is very important
+	DlcCounters in both GRiDLink and Phonelink depend on it.  Vipc2's debugging
+	messages also make assumptions.  Ccdl.AsmConstant has a copy of this 
+	constants for the assembler.  Be careful while changing it.*/
+
+		/* the following errors may occur while reading a long packet */
+
+	eNoDcd					LIT '1',
+	eDcdDropped				LIT '2',
+	eRcvTimeOut				LIT '3',
+	eBadCrc					LIT '4',
+	eBadLength				LIT '5',
+	eInvalidFrame			LIT '6',
+	eOverRun				LIT '7',
+	eBufferOverflow			LIT '8',
+	 	 
+	   	/* the following errors may occur while reading a short packet */
+
+	eShortRcvTimeOut		LIT '9',
+	eShortBadCRC			LIT '10',
+	eShortBadLength			LIT '11',
+	eShortInvalidFrame		LIT '12',
+
+	eUnexpectedInterrupt	LIT '13';
+
+DECLARE
+	/* the following constants are used only for error Counters */
+
+	eInvalidSeq				LIT '14',
+	eFramesRcvd				LIT '15',
+	eFramesSent				LIT '16',
+	eDuplicatesRcvd			LIT '17',
+	eTotalRetries			LIT '18',
+	eMaxRetries				LIT '19',
+	eTotalRNRsRcvd			LIT '20',
+	eTotalRNRsSent			LIT '21';
+
+/* The following are used by phonelink */
+
+DCL ePdlUnknown				LIT 'eNoDcd',
+	ePdlProtocolError		LIT 'eDcdDropped',
+	eFraming				LIT 'eBadLength',
+	eIllegalAck				LIT 'eOverRun',
+	eIllegalDataSeq			LIT '9',
+	etotalPings				LIT 'eTotalRNRsRcvd',
+	eMaxPings				LIT 'eTotalRNRsSent';
+
+DECLARE
+ 	NumOfCounters			LIT '21',
+	NumOfCountersPlus1		LIT '22';
+
+$IF Debugging 
+/* The following are used by cabletest */
+
+DCL	DLC_Msg_MsgOverrun			LIT '14',
+	DLC_Msg_XiDdone				LIT '15',
+	DLC_Msg_XIDMisMatch			LIT '16',
+	DLC_Msg_Started				LIT '17',
+	DLC_Msg_Disconnected 		LIT '18',
+	DLC_Msg_TestDone	 		LIT '19',
+	DLC_Msg_TestMismatch 		LIT '20',
+	DLC_Msg_OutOfBuffers 		LIT '21',
+	DLC_Msg_ProtocolError		LIT '22',
+	DLC_Msg_InvalidSequencing	LIT '23',
+	DLC_Msg_DcdStuckHigh		LIT '24',
+	DLC_Msg_CRCFault			LIT '25',
+	DLC_Msg_displayCRC			LIT '26',
+	DLC_Msg_displayNewCRC		LIT '27',
+
+	DLC_Msg_LastMessage			LIT '25',
+	DLC_Msg_LastMessagePlus1	LIT '26';
+$ENDIF
+

@@ -1,0 +1,389 @@
+$TITLE ('Phone Data Link Interface Routines')
+$COMPACT
+$OPTIMIZE(3) SET(PdlInterface) SET(dataLink)
+
+PdlInterface: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+& 	Phonelink Interface Routines:
+&
+&		DlcInitialize
+&		DlcStart
+&		DlcStop
+&		DlcTerminate
+&		DlcWrite
+&		DlcFreeReceiveBuffer
+&		DlcProcess
+&		DlcReadCounters
+&
+&	LOCAL
+&		Wait
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$SAVE NOLIST
+$INCLUDE (``Incs`PLM.inc~text~)
+$SET (IncludeOsConstants)
+$INCLUDE (``incs`Errors.plm.inc~text~)
+
+$INCLUDE (``incs`OsPLMProcs.inc~text~)
+
+$INCLUDE (``GRiDLink`VfsVipc.Constant.inc~text~)
+$INCLUDE (``GRiDLink`VfsVipc.Type.inc~text~)
+$INCLUDE (``GRiDLink`Vipc.Ext.inc~text~)
+
+$INCLUDE (Pdl.inc~text~)
+$INCLUDE (Dlc.Error.Inc~Text~)
+$INCLUDE (Pdl.Ext.Inc~text~)
+$INCLUDE (PdlGlobals~text~)
+$RESTORE
+
+$IF Debugging
+$INCLUDE (``GRiDLInk`Debug.Inc~Text~)
+DCL DebugMask WORD EXTERNAL;
+$ENDIF
+
+CpAddressOf:  PROCEDURE PTR EXTERNAL; END;
+DCL reasonForDlcDeath WORD EXTERNAL;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Wait
+&	This special wait procedure does a simple OsWait if the calling procedure
+&	is not the same as the DlcProcess.  If it is the same then it will time
+&	wait an call DlcProcess to continue executing the Pdl State machine.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+Wait: PROCEDURE (sem) WORD REENTRANT;
+DCL sem		WORD;
+DCL note	WORD;
+DCL error	WORD;
+DCL dummy	WORD;
+
+	IF DlcProcessID <> OsWhoAmI THEN note = OsWait (sem, 0ffffh, @error);
+	ELSE DO WHILE TRUE;
+		note = OsWait (sem, 50, @error);
+		IF error = 0 THEN RETURN note;
+		ELSE dummy = DlcProcess;
+		END;
+	RETURN note;
+END Wait;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcInitialize - Initialize the Phone data link.
+&
+&	Initialize the modem device driver (attach to modem).  Create semaphores.  
+&	Fork the Pdl Interrupt Service Process.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DlcInitialize: PROCEDURE WORD CLEAN;
+DCL error WORD;
+
+$IF Debugging
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Dlc Initialize',cr,lf);
+		CALL CONLINEOUT (@msg, size (msg));
+		END;
+$ENDIF
+
+	pPromVariables = CpAddressOf;
+
+	/* init the phone link device: modem.  
+	Includes attach to the modem device driver */
+
+	/* create semaphores */
+	AttachComplete = OsCreateSemaphore (@error);
+	TxBufferDesc.writeComplete = OsCreateSemaphore (@error);
+	TxBufferDesc.ReadyForTx = FALSE;
+
+	DlcWriteLock = OsCreateSemaphore (@error);
+
+	IF error = 0 THEN error = ModemInitialize;
+	IF error = 0 THEN error = PdlFrameInitialize;
+	RETURN (error);
+END DlcInitialize;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&  	DlcStart: Start the Phone data link.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DlcStart: PROCEDURE (pDataLinkInfo) WORD CLEAN;
+DCL pDataLinkInfo 	PTR,
+	dataLinkInfo 	BASED pDataLinkInfo DataLinkInfoType;
+DCL (error, dummy) 	WORD;
+
+$IF Debugging
+	DCL msg CharStr ('Dlc Start',cr,lf);
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN 
+		CALL CONLINEOUT (@msg, size (msg));
+$ENDIF
+
+	IF currentState = SxDisconnected THEN 
+	  	DO;
+		/* Clear any pending signal on DlcWriteLock */
+		dummy = OsWait (DlcWriteLock, 0, @dummy);
+		CALL OsSignal (DlcWriteLock, signalNormal, 0, @Dummy);
+
+		IF (error := ModemStart (pDataLinkInfo)) = 0 THEN
+			DO;   
+			CALL StartRfc;
+			/* Now wait until data link is connected */
+			error = OsWait (TxBufferDesc.writeComplete, 0ffffh, @dummy);
+
+			/* Set activity timeout.  The activity timeout parameters is
+			to be treated as follows:
+						0		-	default
+						ff		- 	infinite
+						other	-	the timeout value in minutes.  
+			*/
+
+			IF dataLinkInfo.activityTimeout = 0 THEN
+				activityTimeOutValue = defaultActivityTimeOut;
+			ELSE IF dataLinkInfo.activityTimeout = 0ffh THEN
+				activityTimeOutValue = 0ffffh;
+			ELSE activityTimeOutValue = dataLinkInfo.activityTimeout * 60;
+			END;
+		END;
+	ELSE error = eNotSupport;
+
+$IF Debugging
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Dlc Start Error:');
+		CALL CONLINEOUT (@msg, size (msg));
+		CALL DecimalOut (error);
+		CALL newline;
+		END;
+$ENDIF
+	RETURN (error);
+END DlcStart;
+
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcStop: Stop the Phone data link.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DlcStop: PROCEDURE (reason) CLEAN;
+DCL (reason, error, note) WORD;
+
+$IF Debugging
+	IF (DebugMask AND Dbits_DlcEvents) <> 0 THEN
+		DO;
+		DCL msg CharStr ('Dlc Stop',cr,lf);
+		CALL CONLINEOUT (@msg, size (msg));
+		END;
+$ENDIF
+
+	error = 0;
+	DISABLE;
+	IF (currentState = SxConnected) THEN
+		DO;
+		lastState = currentState;
+		currentState = SxDisconnecting;
+		ENABLE;
+		CALL DisconnectDlc (reason);
+		/* DisconnectDlc will cause snooze signal, need OsDelay to force
+		reschedule */
+		CALL OsDelay (0);
+		END;
+
+	ELSE ENABLE;
+END DlcStop;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcTerminate: Terminate the Phone data link.
+&
+&	Terminate the modem device driver (detach the modem).  
+&	Delete semaphores.  Delete the Pdl Interrupt Service Process.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DlcTerminate: PROCEDURE WORD CLEAN;
+DCL (error, dummy) WORD;
+DCL i BYTE;
+
+$IF Debugging
+DCL Headermsg			CharStr (cr,lf,'  *** STATISTICS ***', cr,lf,
+							'Errors: Tmot  CRC  Len  Frm Ovrn Ovfl',cr,lf,
+							'       '),
+	InvalidSeqCntMsg 	CharStr (cr,lf,'Invalid Seq Cnt:  '),
+	framesRcvdMsg 		CharStr (cr,lf,'Frames Rcvd:      '),
+	framesSentMsg 		CharStr (cr,lf,'Frames Sent:      '),
+	duplicatesRcvdMsg 	CharStr (cr,lf,'duplicates Rcvd:  '),
+	totalRetriesMsg 	CharStr (cr,lf,'total Retries:    '),
+	maxRetriesMsg 		CharStr (cr,lf,'max Retries:      '),
+	totalPingsMsg 		CharStr (cr,lf,'total Pings:      '),
+	maxPingsMsg 		CharStr (cr,lf,'max Pings:        ');
+
+DCL msg CharStr ('Terminate Phonelink',cr,lf);
+
+	IF MajorEventsMaskSet THEN CALL ConLineOut (@msg, size (msg));
+
+	CALL ConLineOut (@HeaderMsg, size(HeaderMsg));
+	DO i = eRcvTimeOut TO eBufferOverFlow;
+		CALL ConCharOut (' ');
+		CALL ConHexOut (DlcCounters (i));
+		END;
+
+	CALL newline;
+	CALL ConLineOut (@invalidSeqCntmsg, size(invalidSeqCntmsg)); 
+	CALL ConHexOut (DlcCOunters (einvalidSeq));
+	CALL ConLineOut (@framesRcvdmsg, size(framesRcvdmsg)); 
+	CALL ConHexOut (DlcCOunters (eframesRcvd));
+	CALL ConLineOut (@framesSentmsg, size(framesSentmsg)); 
+	CALL ConHexOut (DlcCOunters (eframesSent));
+	CALL ConLineOut (@duplicatesRcvdmsg, size(duplicatesRcvdmsg)); 
+	CALL ConHexOut (DlcCOunters (eduplicatesRcvd));
+	CALL ConLineOut (@totalRetriesmsg, size(totalRetriesmsg)); 
+	CALL ConHexOut (DlcCOunters (etotalRetries));
+	CALL ConLineOut (@maxRetriesmsg, size(maxRetriesmsg)); 
+	CALL ConHexOut (DlcCOunters (emaxRetries));
+	CALL ConLineOut (@totalPingsmsg, size(totalPingsmsg)); 
+	CALL ConHexOut (DlcCOunters (etotalPings));
+	CALL ConLineOut (@maxPingsmsg, size(maxPingsmsg)); 
+	CALL ConHexOut (DlcCOunters (emaxPings));
+	CALL newline;
+
+$ENDIF
+$EJ
+
+	IF currentState = SxConnected THEN CALL DlcStop (eDlcLocalDisconnect);
+
+	/* delete the semaphores created by DlcInitialize */
+
+	CALL OsDeleteSemaphore (AttachComplete, @error);
+	CALL OsDeleteSemaphore (TxBufferDesc.writeComplete, @error);
+	CALL OsDeleteSemaphore (DlcWriteLock, @error);
+
+	/* reset the modem device driver */
+
+	CALL ModemReset;
+	CALL PdlFrameReset;
+	currentState = SxDisconnected;  /* make sure state is disconnected */
+
+$IF Debugging
+	IF MajorEventsMaskSet THEN
+		DO;
+		DCL msg CharStr ('Phonelink Terminated - error:');
+		CALL ConLineOUt (@msg, size (msg));
+		CALL ConHexOut (error);
+		CALL newline;
+		END;
+$ENDIF
+
+	RETURN (error);
+
+END DlcTerminate;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcWrite - write to the data link
+&
+&		The data is in two parts each with a corresponding length.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DlcWrite: PROCEDURE (length1, pPart1, length2, pPart2, synchronous) WORD CLEAN;
+
+DCL length1			WORD;		/* length of Part1 */
+DCL length2 		WORD;		/* length of Part2 */
+DCL pPart1			PTR;		/* ptr to first data to send */
+DCL pPart2	 		PTR;		/* ptr to second data to send */
+DCL	synchronous 	BOOLEAN;  	/* TRUE = wait for write to complete */
+
+DCL note			WORD;
+DCL error1			WORD;
+
+	IF currentState <> SxConnected THEN RETURN (reasonforDlcDeath);
+
+	/* wait for the write lock to be signalled before proceeding to
+	set up the write buffers */
+
+	note = Wait (DlcWriteLock);
+	IF note <> 0 THEN 
+		DO;
+		/* Signal with the same error, so that all processes waiting
+		on this lock get the error */
+		CALL OsSignal (DlcWriteLock, signalNormal, note, @error1);
+		RETURN (note);
+		END;
+
+	TxBufferDesc.length1 	= length1;
+	TxBufferDesc.pPart1 	= pPart1;
+	TxBufferDesc.length2 	= length2;
+	TxBufferDesc.pPart2 	= pPart2;
+	TxBufferDesc.synchronous= synchronous;
+	TxBufferDesc.readyForTx = TRUE;
+
+	CALL StartDataFrame;
+	/* the buffer is now set up for the Isep which will send the buffer
+	at the next opportunity. */
+
+	/* If synchronous then wait until write is complete.  If the data link 
+    goes down for any reason, DlcProcess will signal with the error in the
+	note field */
+
+	IF synchronous THEN 
+		note = Wait (TxBufferDesc.writeComplete);
+
+	RETURN (note);
+END DlcWrite;
+
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcFreeReceiveBuffer: free the receive buffer for next frame
+&	Since there is only one receive buffer, implementation is trivial.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DlcFreeReceiveBuffer: PROCEDURE CLEAN;
+$IF Debugging
+	IF RxBufferFree THEN
+		DO;
+			DCL msg CharStr ('Freeing Free Buffer', cr,lf);
+		CALL ConLineOut (@msg, size(msg));
+		END;
+$ENDIF
+	RxBufferFree = TRUE;
+END DlcFreeReceiveBuffer;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcProcess:
+&	This is pseudo process, since it is called by the real VipcProcess
+&	at least every 100 ms.   It is used by phonelink to receive & transmit
+&	data asynchronously.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+DlcProcess: PROCEDURE WORD CLEAN;
+	RETURN (IsMain);
+END DlcProcess;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DlcReadCounters
+&		Read data link error counters.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+DlcReadCounters: PROCEDURE (pLength, pBuffer) CLEAN;
+	DCL plength PTR,
+		length  BASED pLength WORD;
+
+	DCL pBuffer PTR,
+		Buffer	BASED pBuffer (1) WORD;
+		
+	IF length > (DlcCounters(0)*2+2) THEN length = DlcCounters(0)*2+2;
+	CALL MOVW (@DlcCounters (0), pBuffer, length/2);
+END DlcReadCounters;
+
+
+END PdlInterface;

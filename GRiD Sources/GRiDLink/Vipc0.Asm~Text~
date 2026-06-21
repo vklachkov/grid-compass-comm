@@ -1,0 +1,3 @@
+$PAGEWIDTH (132)
+%SET (ForRom, 0)
+$INCLUDE (Vipc0.Inc~Text~)

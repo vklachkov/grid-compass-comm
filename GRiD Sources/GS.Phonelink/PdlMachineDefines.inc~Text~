@@ -1,0 +1,93 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*
+*			COMPASS CENTRAL Phone DATA LINK CONTROL
+*
+*	includeFile:		PdlMachineDefines.Inc.
+*
+*	contains:			Definitions of data structures for Pdl 
+*						state machines.
+*
+*	WARNING:			The Pdl State Machine should be 
+*						compatible with the Ccdl state 
+*						machine for General Routines to 
+*						work.
+*
+*
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL PdlStateMachineType	LIT 
+		'STRUCTURE (basic1MachDesc, basic2MachDesc,	dlcMachDesc,
+			pdlRetryDesc, PdlVariables, PdlMoreVariables, dlcPriMachDesc,
+			dlcFlushDesc, dlcStatsDesc)';
+
+/*
+			basic1MachDesc, 			## ---
+			basic2MachDesc,				## these 3 parts are identical to gridlink //
+			dlcMachDesc, 		  		## ___
+			pdlRetryDesc,				** these 3 fields overlap //
+			PdlVariables,				** dlcPriRetryDesc, dlcMachFlagsDesc //
+			PdlMoreVariables, 			**
+			dlcPriMachDesc, 			&& ---
+			dlcFlushDesc,				&& these 3 are identical to gridlink //
+			dlcStatsDesc, 				&& ---
+*/
+
+DCL pdlRetryDesc LIT
+			'sendTimeOuts		BYTE,
+			sendOutstanding		BOOLEAN,
+			ackOutStanding		BOOLEAN,
+			resendRequired		BOOLEAN,
+			discXmitCompleted	BOOLEAN,
+			sSendDlCB			SELECTOR';
+
+DCL pdlVariables LIT 
+		/* We only need a byte for connection ID, but then we will have to use
+		a filler byte, and the number of structure members exceed plm compilers
+		limit. */
+			'configured			BOOLEAN,
+			connectionID		WORD,		
+			freeDisp			BOOLEAN';
+
+DCL pdlMoreVariables LIT 
+			'notUsed			(3) BYTE,
+			protocolType		BYTE,
+			activeConnect		BOOLEAN,
+			pollTimerOn			BOOLEAN,
+			pingSent			BOOLEAN,
+			currentRetries		BYTE';
+
+DCL pdlRetryInit LIT
+			'0, FALSE, FALSE, FALSE, FALSE, nullword';
+
+DCL pdlVariablesInit LIT
+			'FALSE, 0, FALSE';
+
+DCL pdlMoreVariablesInit LIT
+			'0, 0, 0, dlcPhonelinkProtocol, FALSE, FALSE, FALSE, 0';
+
+DECLARE pdlMachineInitConstants LITERALLY                        
+        'basic1MachInit, basic2MachInit, dlcMachInit,
+         pdlRetryInit, pdlVariablesInit, pdlMoreVariablesInit, dlcPriMachInit, 
+         dlcFlushInit, dlcStatsInit';
+
+/*  Phone data link control Header  */
+
+DCL PdlcHeader  LIT
+      'frameType        BYTE,      /* frame type      */
+       flags            BYTE,      /* bit flags       */
+       windowSize       BYTE,      /* window size     */
+       seqNumber        BYTE';     /* sequence number */
+
+
+DECLARE DlCBioParams LIT 'pUserCB SELECTOR, spare4 WORD,
+ dataLength WORD';
+
+/* dlc general I/O (send/receive) request/response,
+   asynchronous transmit/receive user request/response:
+   note that the only difference between this and 
+   DlCBioDataparams is that it does not have pBUffer
+
+   pUserCB                      back ptr to dlc request. (sdlc use)
+   spare4                       reserved for future dlc use.
+   dataLength                   actual length of dlc user data. (- hdr)
+*/

@@ -1,0 +1,43 @@
+Copy all subjects from the two archive diskette to a hard disk.  The subjects are
+
+  GRiDLink
+  Incs
+  Libs
+  OsIncs
+
+Select the following develop file
+
+  "z GRiDLink & Phonlink~Develop~"
+
+Press CODE-G and select Yes for only the following source groups
+
+  Vfs,Vipc,Misc sources (common to all)
+  Sources common to all GRiDLinks
+  GRiD-Os GRiDLink sources
+  Sources common to all PhoneLinks
+  GRiD-Os PhoneLink sources
+ 
+Select Compile & Link
+
+  Select All Plm Sources for all files with .Plm
+  Select All Asm Sources for all files with .Asm
+  Select Yes for all files with .Pas
+
+For Link select yes for 
+
+  Vfs/Vipc/Misc
+  GRiD-OS GRiDlink
+  GRiD-OS Phonelink
+
+Compilers PLM    Version 2.3
+          Pascal Version 3.0
+          Link   Version 2.0
+
+NOTE:  While linking there are several places where it will be ask for confirm to continue.  Keep confirming.
+
+The final run files will be under the subject obj with the following names:
+
+  @GRiDLink~Device~
+  @Phonelink~Device~
+
+

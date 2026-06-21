@@ -1,0 +1,247 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsVipc.Type.Inc~Text~:	
+&
+&	This file defines plm literally's for all (or most of) the structures
+&	used in
+&
+&			Vipc Interface
+&			Vipc Protocol
+&			Vfs	 Protocol
+&
+&	need to separate this into 3 files:
+&			VipcProtocol.plmTypes.inc
+&			VfsProtocol.plmTypes.inc
+&			Vipc.plmTypes.inc
+&			Vfs.plmTypes.inc
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vipc Protocol frame structures.
+&
+&	These are structures for vipc frames transmitted between VIPC layers on
+&	Compass and Compass Central.
+&
+&	This structures do not include the data link header.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL VipcSignonType  LIT							/* SignOn */
+		'STRUCTURE (
+			vipcFunctionCode	WORD,
+			PropertyList (1)	BYTE)';	
+
+DCL	VipcSignonHeaderType  LIT
+		'STRUCTURE (
+			vipcFunctionCode	WORD,
+			propertyType		BYTE,
+			lenNValue			WORD)';
+
+
+DCL VipcSignonResponseType  LIT					/* SignOnResponse */
+		'STRUCTURE (
+			vipcFunctionCode	WORD,
+			signOnStatus		WORD,
+			serverNameLen		BYTE,
+			serverNameStr	 	(1)	BYTE)';
+			
+
+DCL	VipcSignoffType  LIT						/* signoff */
+		'STRUCTURE (
+			vipcFunctionCode	WORD)';
+
+
+DCL VipcCommonPart  LIT
+			'VipcFunctionCode	WORD,
+			localPathID			WORD,
+			remotePathID		WORD';
+
+DCL VipcConnectHeaderType  LIT
+		'STRUCTURE (VipcCommonPart)';
+
+DCL VipcConnectResponseType LIT
+		'STRUCTURE (
+			VipcCommonPart,
+			ConnectStatus		WORD)';
+					
+DCL VipcDiscReqType LIT
+		'STRUCTURE (
+        	VipcCommonPart,
+            ReasonForDisconnect	WORD)';
+
+DCL VipcDiscRespType LIT
+		'STRUCTURE (VipcCommonPart)';
+        	
+DCL VipcMessageHeaderPart  LIT
+			'VipcCommonPart,
+			class				WORD,
+			note				WORD,
+			vipcDataLength		WORD';
+
+DCL VipcMessageHeaderType  LIT
+		'STRUCTURE (VipcMessageHeaderPart)';
+
+DCL VipcMsgType  LIT
+		'STRUCTURE (
+        	vipcMessageHeaderPart,
+			vipcData (1)		BYTE)';
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vipc Interface Message Format
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL VipcIfCommonPart LIT
+		'VipcIfCommonPart1,
+		VipcIfCommonPart2';
+
+DCL VipcIfCommonPart1 LIT
+		'VipcFunctionCode	BYTE,
+		ToBeFreed			BYTE,
+		RESERVED (4)		BYTE,
+		sourcePID			WORD,
+		destPID				WORD';
+
+DCL VipcIfCommonPart2 LIT
+		'class				WORD,
+		note				WORD,
+		vipcDataLength		WORD';
+
+DCL VipcIfMsgType LIT
+		'STRUCTURE 
+			(VipcIfCommonPart, 
+			DataArea (1)		BYTE)';
+
+DCL VipcIfDiscArrivedType	LIT
+		'STRUCTURE (
+			VipcIfCommonPart,
+			Error			WORD)';
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vfs Protocol Headers 
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL VfsRequestCommonPart  LIT
+			'VipcMessageHeaderPart,
+			vfsRequest			WORD,			/* file system request code */
+			requestorsConnID	SELECTOR,		/* CID assigned locally */
+			serversConnID		WORD';			/* assigned by remote VFS manager */
+
+DCL SimpleReqType  LIT 
+		'STRUCTURE (VfsRequestCommonPart)';
+
+DCL AttachReqType  LIT 
+		'STRUCTURE (
+			VfsRequestCommonPart,
+			mode			BYTE,
+			access			BYTE,
+			password (17)	BYTE)';
+
+DCL RenameReqType  LIT 
+		'STRUCTURE (VfsRequestCommonPart)';
+
+DCL OpenReqType  LIT 
+		'STRUCTURE (
+			VfsRequestCommonPart,
+			numBuf			BYTE)';
+
+DCL ReadReqType  LIT 
+		'STRUCTURE (
+			VfsRequestCommonPart,
+			vfsDatalength	WORD)';
+
+DCL WriteReqType  LIT 
+		'STRUCTURE (
+			VfsRequestCommonPart,
+			vfsDatalength	WORD)';
+
+DCL SeekReqType  LIT 
+		'STRUCTURE (
+			VfsRequestCommonPart,
+			mode			BYTE,
+			position		DWORD)';
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Responses:
+&	6/14/85	responses do no have VipcMessageHeaderPart.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL VfsRespCommonPart LIT
+		'vfsResponse		WORD,			/* file system response code */
+		serversConnID		WORD,			/* assigned by remote VFS manager */
+		requestorsConnID	SELECTOR,		/* CID assigned locally */
+		Error				WORD';			/* error status */
+
+DCL SimpleRespType LIT 
+		'STRUCTURE (VfsRespCommonPart)';
+
+
+DCL ReadRespType  LIT 
+		'STRUCTURE
+			(VfsRespCommonPart,
+			vfsDatalength	WORD,
+			buffer (1)		BYTE)';
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Miscellaneous Vipc Types
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+DCL SavedUserInfoType LIT
+		'STRUCTURE (
+			TotalLength		WORD,
+			firstProperty	BYTE)';
+
+
+DCL	DatalinkInfoType  LIT
+		'STRUCTURE (
+			DataLinkInfoPart1,
+			DataLinkInfoPart2)';
+
+DCL	MsDosDatalinkInfoType  LIT
+		'STRUCTURE (
+			DataLinkInfoPart1,
+			MsDosDataLinkInfoPart2)';
+
+DCL DataLinkInfoPart1 LIT	'modemType	BYTE, baudRate BYTE, 
+		waitInVoiceMode	BOOLEAN, speakerVolume BYTE, connectTimeout	WORD';		
+
+$IF comment
+'modemType			BYTE,		/* 0 for system serial, 
+								   1 for system modem */
+baudRate			BYTE,		/* 5-300 bps, 7-1200 bps, etc */
+								/* 0FD for external */
+								/* 0F0 when divisor supplied */
+waitInVoiceMode		BOOLEAN,
+speakerVolume		BYTE,		/* 0 - 0ff, 255 max */
+connectTimeout		WORD';		/* time to wait before giving up connection if
+								phone does not answer or handshake is not
+								successfull. Unit = 10ms; 0ffffh = infinite */
+$ENDIF
+
+DCL DataLinkInfoPart2 LIT
+
+'activityTimeout	BYTE,		/* time for which phone line will be kept alive
+								without any activity.  Unit = 1 min */
+touchTone			BOOLEAN,	/* false for pulse dialling */
+phoneNumberLen		BYTE,		/* len of phone no string */
+phoneNumberStr 	(1) BYTE';		/* phone number string */
+
+/* There is another word field for baudRateValue immediately after the 
+phone number string and is valid only if buadRate = 0f0h. This is not
+implemented in MsDos yet (9/25/85). */
+
+DCL MsDosDataLinkInfoPart2 LIT
+
+/* The only difference between this and the previous structure is that 
+MsDosDataLinkInfo has a fixed size phone number str */
+
+'activityTimeout	BYTE,		/* time for which phone line will be kept alive
+								without any activity.  Unit = 1 min */
+touchTone			BOOLEAN,	/* false for pulse dialling */
+phoneNumberLen		BYTE,		/* len of phone no string */
+phoneNumberStr 	(35) BYTE';		/* phone number string */
+

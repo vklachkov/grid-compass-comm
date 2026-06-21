@@ -1,0 +1,1338 @@
+$TITLE ('Virtual Inter Process Communication Layer - Part 2')
+$COMPACT
+$OPTIMIZE(3) SET(vipc2) SET(VipcLayer)
+
+VIPC2: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	This is VIPC2. It contains the VIPC process.
+&
+&		PROCESS:
+&
+&			VipcProcess
+&
+&		Procedures Called From EntryPoint
+&
+&			VipcInitialize
+&			VipcTerminate
+&
+&		Procedures Called From Vfs1,3 
+&
+&			GetBigVipcQLock			  	;also vipc1
+&			ReleaseBigVipcLock			;also vipc1
+&			VipcDisableActivityTimeout
+&			VipcEnableActivityTimeout
+&			VipcReleaseResources
+&			HowIsVipc
+&
+&		Called form Vipc1
+&
+&			AddVipcConnIDToList
+&			DeleteVipcConnIDFromList
+&
+&		Called from Data Link:
+&
+&			VipcProcessDataLinkEvent
+&			VipcFrameArrived
+&
+&		Support Routines:
+&
+&			ValidVipcConnection
+&			ProcessDisconnect
+&			DisconnectAllConnections
+&			ProcessTimeout
+&			ProcessAsyncFrame
+&
+&	Author:	Rajendra Shah
+&	Start Date:	3/15/83.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+$EJECT
+$SAVE NOLIST
+	/* My favourite Plm literals */
+
+$INCLUDE (``Incs`Plm.Inc~Text~)
+
+	/* Os constants, types and externals */
+
+$INCLUDE (``OsIncs`Os.Error.Inc~Text~)
+$INCLUDE (``Incs`Errors.plm.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Constant.Inc~Text~)
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+
+	/* constants and types */
+
+$INCLUDE (VfsVipc.Constant.Inc~Text~)
+$INCLUDE (VfsVipcConnCB.Type.Inc~Text~)
+$INCLUDE (VfsVipc.Type.Inc~Text~)
+
+	/* externals */
+
+$INCLUDE (Vipc.Ext.Inc~Text~)
+$INCLUDE (Vfs.Ext.Inc~Text~)
+$INCLUDE (Dlc.Ext.Inc~Text~)
+
+/* This is from Cp.MemMgr.Ext.Inc */
+
+/*IntAllocate: PROCEDURE (pid, length, pError) PTR EXTERNAL;
+	DCL pid	WORD;
+	DCL length WORD;
+	DCL pError PTR;
+	END;*/
+
+/*IntSend: PROCEDURE (sourcePid, destPid, msgClass, note, pMsg, pError) EXTERNAL;
+  DCL sourcePid    WORD;
+  DCL destPid      WORD;
+  DCL msgClass     WORD;
+  DCL note         WORD;
+  DCL pMsg         PTR;
+  DCL pError       PTR;
+  END;*/
+
+Wmin: PROCEDURE (a, b) WORD EXTERNAL;
+  	DCL (a, b) WORD;	
+	END;
+
+/* VipcProcess is in ROM and so it can not have any fix-ups.  Hence it has
+to be in compact mode.  To set up the DS the OsForkProcess call refers to
+RamVipcProcess which is an assembly language routine in DATA segment.  To fool
+the compiler to PUSH DS instead of CS RamVipcProcess is declared as a byte
+here. */
+
+DCL RamVipcProcess BYTE EXTERNAL;
+
+$IF Debugging 
+$INCLUDE (Dlc.Error.Inc~Text~)
+$INCLUDE (Debug.Inc~Text~)
+$INCLUDE (Twitch.Ext.Inc~Text~)
+
+DCL debugMask	WORD	EXTERNAL;
+
+DCL (DlcMsg1,DlcMsg2)	WORD INITIAL (0,0), 
+	DlcMsgOverRun		BYTE INITIAL (FALSE);
+
+DCL (DlcMsgAddInfo1, 
+	DlcMsgAddInfo2) 	WORD;
+
+
+
+$INCLUDE (CCdl.Type.Inc~Text~)
+DCL Buffer (26) BYTE;
+DCL RxBufferCopy RxBufDescType AT (@Buffer);
+DCL (Ns, Nr, NsReceived, NrReceived) BYTE;
+
+DCL DlcStateInfoTYPE AS 
+		'STRUCTURE
+			(state		BYTE,
+			event		BYTE,
+			pollBitOn 	BYTE)',
+	DlcStateInfoCopy DlcStateInfoType;
+
+$ENDIF
+
+$RESTORE
+
+
+DCL VipcProcessID	WORD;
+
+	/* shared variables between VipcProcessDataLinkEvent and the VipcProcess */
+
+DCL VipcEventSemaphore	WORD;
+
+DCL (dataLinkDied,
+	activityTimeout,
+	frameToBeProcessed,
+	toBeTwitched)		BOOLEAN INITIAL (false, false, false, false);
+
+DCL reasonForDataLinkDeath	WORD PUBLIC;
+
+DECLARE WindowExtent STRUCTURE ((x, y) WORD);
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Add, Delete & Validate Vipc Connection:
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL BigVipcLock			WORD;
+
+DCL maxVipcConnections	AS	'20';
+DCL connectionList		(maxVipcConnections) WORD PUBLIC;
+DCL VipcConnections		BYTE PUBLIC INITIAL (0);
+
+	/* ActivityTimeoutCnt is incremented by VipcDisableTimeOUt 
+	and decremented by VipcEnableTimeout. ActivityTimeOUtDisable is
+	set to false only when the ___cnt is 0. */
+
+DCL ActivityTimeOutDisabled	BOOLEAN INITIAL (FALSE);
+DCL ActivityTimeOutCnt 		BYTE 	INITIAL (0);
+
+GetBigVipcLock: PROCEDURE CLEAN;
+DCL (note, error) WORD;
+	note = OsWait (BigVipcLock, 0ffffh, @Error);
+END GetBigVipcLock;
+
+
+
+ReleaseBigVipcLock: PROCEDURE CLEAN;
+	DCL error WORD;
+	CALL OsSignal (BigVipcLock, signalNormal, 0, @error);
+END ReleaseBigVipcLock;
+
+
+HowIsVipc: PROCEDURE (vipcConnID) WORD CLEAN;
+DCL vipcConnID	WORD;
+DCL	sVipcCOnnCB			SELECTOR AT (@vipcConnID),
+	vipcConnCB			BASED	sVipcConnCB	VipcConnCBType;
+
+	IF vipcConnCB.connState <> VIPC_Cx_Connected
+		THEN RETURN (vipcConnCB.reasonForDisconnect);
+	ELSE RETURN (eOk);
+END HowIsVipc;
+
+VipcDisableActivityTimeOut: PROCEDURE CLEAN;
+	IF Phonelink THEN
+		DO;
+		CALL GetBigVipcLock;
+		ActivityTimeOutCnt = ActivityTimeOUtCnt + 1;
+		ActivityTimeOutDisabled = TRUE;
+		CALL ReleaseBigVipcLock;
+		END;
+END VipcDisableActivityTimeOut;
+
+
+VipcEnableActivityTimeOut: PROCEDURE CLEAN;
+	IF Phonelink THEN	
+		DO;
+$		IF Debugging
+ 		IF ActivityTimeoutcnt = 0 THEN
+			DO;
+			DCL msg CharStr ('Something is wrong with activityTimeout',cr,lf);
+			CALL COnLIneOUt (@msg, size (msg));
+			END;
+$		ENDIF
+		CALL GetBigVipcLock;
+		IF (ActivityTimeOutCnt := ActivityTimeOUtCnt - 1) = 0 
+			THEN ActivityTimeOutDisabled = FALSE;
+		CALL ReleaseBigVipcLock;
+		END;
+END VipcEnableActivityTimeOut;
+
+
+AddVipcConnIDToList: PROCEDURE (vipcConnID) WORD CLEAN;
+DCL vipcConnID	WORD;
+DCL error	WORD;
+	CALL GetBigVipcLock;
+
+$IF Debugging
+	IF ValidVipcCOnnection (vipcConnID) THEN
+		DO;
+		DCL msg CharStr ('Duplicate VipcConnID:');
+		CALL ConlineOUt (@msg, size (msg));
+		CALL Hexout (VIpcConnID);
+		CALL newline;
+		error = eBadConn;
+		END;
+	ELSE 
+$ENDIF
+
+	IF vipcConnections = MaxVipcConnections
+		THEN error = eTooManyIPCConnections;
+	ELSE
+		DO;
+		connectionList (vipcConnections) = vipcConnID;
+		vipcConnections = vipcConnections + 1;
+		error = 0;
+		END;
+
+	CALL ReleaseBigVipcLock;
+	RETURN (error);
+END AddVipcConnIDToList;
+
+
+
+DeleteVipcConnIDFromList: PROCEDURE (vipcConnID) CLEAN;
+DCL vipcConnID	WORD;
+DCL i		BYTE;
+
+/* There is no need to use locks around here since all routines calling 
+DeleteVipcConnIDFromList are locked by the same lock */
+
+	DO i = 0 TO (vipcConnections-1);
+		IF connectionList (i) = vipcConnID THEN
+			DO;
+			vipcConnections = vipcConnections - 1;
+			CALL MovW (@connectionList (i+1),
+						@connectionList (i),
+						vipcConnections - i);
+$IF Debugging
+			IF (debugMask AND Dbits_Vipc) <> 0 THEN
+				DO;
+				CALL ConLineOut (@('IPC Conn deleted:'), 17);
+				CALL HexOut (vipcConnID);
+				CALL NewLine;
+				END;
+$ENDIF	
+			RETURN;
+			END;
+		END;
+
+$IF Debugging
+	CALL ConLineOUt (@('Conn not found in DeleteVipcConnIDFromList,cid:'), 47);
+	CALL hexOut (vipcConnID);
+	CALL NewLine;
+$ENDIF	
+
+END DeleteVipcConnIDFromList;
+
+
+
+VipcReleaseResources: PROCEDURE (vipcConnID) CLEAN;
+DCL vipcConnID		WORD;
+DCL	sVipcCOnnCB		SELECTOR AT (@vipcConnID);
+DCL error1 			WORD;
+
+	CALL DeleteVipcConnIDFromList (vipcConnID);
+	CALL OsFree (BUILD$PTR (sVipcConnCB, 0), @Error1);
+$	IF Debugging
+	IF error1 <> 0 THEN
+		DO;
+			DCL msg CharStr ('Error in OsFree:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (error1);
+		CALL Newline;
+		END;
+$	ENDIF
+END	VipcReleaseResources;
+
+
+
+ValidVipcConnection: PROCEDURE (vipcConnID) BOOLEAN CLEAN;
+DCL vipcConnID	WORD;
+DCL i			WORD;
+
+	IF vipcCOnnections = 0 THEN RETURN (FALSE);
+	DO i = 0 TO (vipcConnections-1);
+		IF connectionList (i) = vipcConnID THEN RETURN TRUE;
+		END;
+
+	RETURN (false);
+END ValidVipcConnection;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ProcessDisconnect:
+&
+&	do the local processing for disconnecting a
+&	connection.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ProcessDisconnect: PROCEDURE (vipcConnID, reason) REENTRANT;
+DCL vipcConnID			WORD,
+	reason				WORD;
+
+DCL error				WORD;
+DCL	sVipcCOnnCB			SELECTOR AT (@vipcConnID),
+	vipcConnCB			BASED	sVipcConnCB	VipcConnCBType;
+
+DCL pVipcIfDiscArrived	POINTER,
+	VipcIfDiscArrived	BASED pVipcIfDiscArrived VipcIfDiscArrivedType;
+DCL clientProcessID		WORD;
+DCL connState			WORD;
+DCL error1				WORD;
+
+$IF Debugging
+	IF (debugMask AND Dbits_Vipc) <> 0 THEN
+		DO;
+		DCL msg CharStr ('IPC Disconnect:cid/reason:');
+		CALL ConLineOut (@msg, size(msg));
+		CALL HexOut (vipcConnID);
+		CALL HexOut (reason);
+		CALL NewLine;
+		END;
+$ENDIF	
+
+
+	connState = VipcConnCB.connState;
+	IF connState <> Vipc_Cx_Disconnected 
+		THEN vipcConnCB.reasonForDisconnect = reason;
+	
+	vipcConnCB.connState = VIPC_Cx_Disconnected;
+
+	IF (connState = VIPC_Cx_ConnectSent)
+		OR (connState = VIPC_Cx_DisConnectSent) THEN
+
+		CALL OsSignal (vipcConnCB.respReceived,
+		                SignalNormal,
+						reason,
+						@Error1);
+
+	ELSE IF connState = Vipc_Cx_Connected THEN
+		DO;
+		IF vipcConnCB.clientIsVfs THEN
+			DO;
+			CALL VfsResetVipcConnForDevice (vipcConnID);
+
+			IF vipcConnCB.vfsConnections = 0 
+				THEN CALL VipcReleaseResources (vipcConnID);
+
+				/* else there are file system connections on this vipc connections
+				which are not detached.  The last detach will release vipc 
+				resources */
+			END;
+
+		ELSE
+			DO;
+				/* client is not vfs, it is a user process.  Inform 
+				the client that the connection is disconnected. */
+
+			clientProcessID = vipcConnCB.clientProcessID;
+			pVipcIfDiscArrived = intAllocate (
+							clientProcessID,
+							SIZE (VipcIfDiscArrived),
+							@error);
+
+			IF error = 0 THEN
+				DO;
+				VipcIfDiscArrived.vipcFunctionCode = VIPC_Ix_DisconnectArrived;
+				VipcIfDiscArrived.ToBeFreed = TRUE;
+				VipcIfDiscArrived.sourcePID = vipcConnID;
+				VipcIfDiscArrived.destPID = clientProcessID;
+				VipcIfDiscArrived.class	= Vipc_Function_Class;
+				VipcIfDiscArrived.note = 0;
+				VipcIfDiscArrived.vipcDataLength = 2;
+				VipcIfDiscArrived.error = reason;
+
+				CALL IntSend (vipcConnID,
+							clientProcessID,
+							VIPC_Function_class,
+							0,
+							pVipcIfDiscArrived,
+							@error);
+
+				IF error <> 0 THEN 
+                	DO;
+			        CALL OsFree (pVipcIfDiscArrived, @error1);	
+$					IF Debugging
+					IF error1 <> 0 THEN
+						DO;
+						DCL msg CharStr ('Error in OsFree:');
+						CALL ConLineOut (@msg, size(msg));
+						CALL HexOut (error1);
+						CALL Newline;
+						END;
+$					ENDIF
+					END;
+
+$IF Debugging
+				IF (debugMask AND Dbits_Vipc) <> 0 THEN 
+					DO;
+					CALL ConLineOut (@('Disconnect Message Queued To'), 28);
+					CALL HexOut (clientProcessID);
+					CALL NewLine;
+					IF error <> 0 THEN
+						DO;
+						CALL ConLineOut (@('Error in Queueing:'), 18);
+						CALL HexOUt (error);
+						CALL NewLine;			
+						END;
+					END;
+$ENDIF
+				END;
+			END;
+		END;
+	/* 
+	else if VIPC_Cx_Disconnected then ignore 
+	else if connect rcvd not implemented */
+
+END ProcessDisconnect;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DisconnectAllConnections:
+&
+&	GO through the connection list and disconnect
+&	all connections.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DisconnectAllConnections: PROCEDURE (reason) REENTRANT;
+DCL reason WORD;
+DCL i		WORD;
+
+	CALL GetBigVipcLock;
+
+	i = VipcConnections;
+	DO WHILE i > 0;
+		i = i - 1;
+		CALL ProcessDisconnect (ConnectionList (i), reason);
+	END;
+
+$IF Debugging
+	IF (debugMask AND Dbits_Vipc) <> 0 THEN 
+		DO;
+		CALL ConLineOut (@('All VipcConnections Disconnected',cr,lf), 34);
+		END;
+$ENDIF
+
+	CALL ReleaseBigVipcLock;
+END DisconnectAllConnections;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcFrameArrived:
+&
+&	A frame has arrived.  If it is a response to signon, connect, disconnect
+&	or a file system call, signal the waiting process directly, else set
+&	the share variable FrameToBeProcessed, so that the Vipc process can hadle
+&	it.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcFrameArrived: PROCEDURE REENTRANT;
+DCL	VipcFrame		BASED pFrameArrived VipcMsgType;
+DCL error			WORD;
+
+DCL vipcConnID		WORD,
+	sVipcConnCB		SELECTOR AT (@vipcConnID),
+	VipcConnCB		BASED sVipcConnCB VipcConnCBType;
+
+	/* Assume that the frame is invalid, if the frame is fine, 
+	this error will be changed */
+
+error = eIpcProtocolError;
+
+IF vipcFrame.vipcFunctionCode = VIPC_Px_SignonResponse THEN
+	DO;
+		/* vipc layer must be in signonSend state, else ignore the frame
+		If so notify the waiting process */
+
+	IF vipcLayerState = VIPC_Lx_SignonSent
+		THEN Call OsSignal (SignOnSemaphore, signalNormal OR 80h, 0, @error);
+	END;
+
+ELSE
+	DO;
+		/* For rest of the frame, a connection ID must be received, this
+		connection ID must be a valid VIPC connection ID */
+
+	vipcConnID = VipcFrame.remotePathID;
+	IF ValidVipcConnection (vipcConnID) THEN
+		DO;
+		IF vipcFrame.vipcFunctionCode = VIPC_Px_ConnectResponse THEN
+			DO;
+
+				/* The waiting process must be in connect sent state,
+				if so signal that process */
+
+			IF vipcConnCB.connState = VIPC_Cx_connectSent
+				THEN Call OsSignal (vipcConnCB.respReceived,
+									signalNormal OR 80h,
+									0,
+									@error);
+			END;
+
+		ELSE
+			DO;
+				/* for the rest of the remote frames, the local path ID must
+				match the remote PathID field in the connection control block */
+
+			IF vipcFrame.localPathID = vipcCOnnCB.remotePathID THEN
+				DO;
+				IF vipcFrame.vipcFunctionCode = VIPC_Px_DisconnectResponse THEN 
+					DO; 
+						/* The waitig process must be in disconnectSent state.
+						If so notify the process.*/
+
+					IF vipcConnCB.connState = VIPC_Cx_DisconnectSent
+						THEN Call OsSignal (vipcConnCB.respReceived,
+											signalNormal OR 80h,
+											0,
+											@error);
+					END;
+
+				ELSE IF (vipcFrame.vipcFunctionCode = VIPC_Px_Msg) THEN
+					DO;
+					error = 0;
+					IF vipcConnCB.clientIsVFS
+						THEN CALL VfsResponseArrived (pFrameArrived);
+					ELSE frameToBeProcessed = TRUE;
+					END;
+
+				ELSE IF (vipcFrame.vipcFunctionCode = VIPC_Px_Disconnect)
+					THEN frameToBeProcessed = TRUE;
+
+					/* ignore rest of the type of frames - may be an error
+					should be sent back */
+				END;
+			END;
+		END;
+	END;
+
+$IF Debugging
+	IF error = eIpcProtocolError THEN
+		DO;
+		frameToBeProcessed = TRUE;
+		RETURN;
+		END;
+$ENDIF
+
+	/* In the release version, ignore an invalid frame */
+
+	IF error <> 0 THEN Call DlcFreeReceiveBuffer;
+
+END VipcFrameArrived;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcProcessDataLinkEvent:
+&
+&	Data Link calls this routine whenever an event occurs which is of interest
+&	to VIPC.  Such events are:
+&
+&			Dlc_Ex_IdlePollTwitch	used only for debugging
+&			Dlc_Ex_WriteComplete	to indicate write activity
+&			Dlc_Ex_FrameArrived		a remote process is to be processed by VIPC.
+&			Dlc_Ex_Disconnected		data link disconnected.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcProcessDataLinkEvent: PROCEDURE (DataLinkEvent, pBuffer, error) PUBLIC;
+DCL DataLinkEvent	WORD,
+	pBuffer			PTR,
+	error			WORD;
+
+	IF DataLinkEvent = Dlc_Ex_frameArrived THEN
+		DO;
+		pFrameArrived = pBuffer;
+		CALL VipcFrameArrived;
+		END;
+
+$IF Debugging
+	ELSE IF DataLinkEvent = Dlc_Ex_IdlePollTwitch THEN toBeTwitched = TRUE;
+
+	ELSE IF DataLinkEvent = DLc_Ex_PrintDlcMsg THEN
+		DO;
+		IF NOT Phonelink AND (error = Dlc_Msg_InvalidSequencing) 
+			THEN CALL MovB (pBuffer, @Ns, 4);
+		IF error <= eUnexpectedInterrupt THEN
+			DO;
+			IF (DlcMsg1 <> 0) AND (DlcMsg2 <> 0) THEN DlcMsgOverRun = True;
+			ELSE 
+			 	DO;
+				IF DlcMsg1 = 0 THEN DlcMsg1 = error;
+	            ELSE DlcMsg2 = error;
+				IF NOT Phonelink THEN
+					DO;
+					IF error < eShortRcvTimeOut 
+						THEN CALL MovB (pBuffer, @RxBufferCopy, 26);
+						ELSE CALL MovB (pBuffer, @RxBufferCopy.Addr, 4);
+					IF error = Dlc_Msg_ProtocolError THEN
+						DO;
+						DCL DlcStateInfo BASED pBUffer DlcStateInfoType;
+						CALL MovB (pBuffer, @DlcStateInfoCopy, 
+									SIZE(DlcStateInfoCopy));
+						END;
+					END;
+				END;
+			END;
+
+		ELSE IF (debugMask AND Dbits_MajorEvents) <> 0 THEN 
+			DO;
+			DCL DlcMsgAdditionalInfo BASED pBuffer WORD;
+			IF DlcMsg1 = 0 THEN 
+				DO;
+				DlcMsg1 = error;
+				DlcMsgAddInfo1 = DlcMsgAdditionalInfo;
+				END;
+	        ELSE IF DlcMsg2 = 0 THEN 
+				DO;
+				DlcMsg2 = error;
+				DlcMsgAddInfo2 = DlcMsgAdditionalInfo;
+				END;
+			ELSE DlcMsgOverRun = TRUE;
+			END;
+
+		ELSE RETURN;
+		END;
+
+	ELSE IF DataLinkEvent = Dlc_Ex_Started THEN
+		DO;
+		IF (debugMask AND Dbits_MajorEvents) <> 0 THEN 
+			DO;
+			IF dlcMsg1 = 0 THEN DlcMsg1 = Dlc_Msg_Started;
+			ELSE IF dlcMsg2 = 0 THEN DlcMsg2 = Dlc_Msg_Started;
+			ELSE DlcMsgOverRun = TRUE;
+			END;
+		END;
+$ENDIF
+
+	ELSE IF DataLinkEvent = Dlc_Ex_Disconnected THEN
+		DO;
+		dataLinkDied = TRUE;
+		reasonForDataLinkDeath = error;
+$IF Debugging
+		IF (debugMask AND Dbits_MajorEvents) <> 0 THEN 
+			DO;
+			IF dlcMsg1 = 0 THEN dlcMsg1 = Dlc_Msg_Disconnected;
+			ELSE IF dlcMsg2 = 0 THEN dlcMsg2 = Dlc_Msg_Disconnected;
+			ELSE dlcMsgOverrun = TRUE;
+			END;
+$ENDIF
+		END;
+
+	ELSE IF DataLinkEvent = Dlc_Ex_ActivityTimeOut THEN
+		DO;
+		IF NOT ActivityTimeOutDisabled THEN activityTimeOut = TRUE;
+		END;
+
+	/* wake up vipc process */
+	CALL OsSignal (VipcEventSemaphore, signalNormal OR 80h, 0, @error);
+
+END VipcProcessDataLinkEvent;
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	ProcessAsyncFrame:
+&
+&	Synchronous vipc frames from remote, i.e, response to connect, disconnect and
+&	file system requests are handled directly by the interrupt service routine
+&	and the waiting process.  Rest of the vipc frames which arrive asynchronously
+&	are to be processed here.  Such vipc frames include:
+&
+&			User Message frames.
+&			and disconnects request from remote.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ProcessAsyncFrame: PROCEDURE REENTRANT;
+DCL vipcFrame		BASED pFrameArrived VipcMsgType;
+DCL vipcConnID		WORD,
+	sVipcConnCB		SELECTOR AT (@vipcConnID),
+	vipcConnCB		BASED sVipcConnCB		VipcConnCBType;
+DCL error			WORD;
+DCL error1			WORD;
+
+DCL pVipcIfMsg		POINTER,
+	VipcIfMsg		BASED pVipcIfMsg VipcIfMsgType;
+DCL clientProcessID WORD;
+
+
+$IF Debugging
+	IF (debugMask AND Dbits_Vipc) <> 0 THEN 
+		CALL ConLineOut (@('Msg Rcvd '), 9);
+$ENDIF
+
+	CALL GetBigVipcLock;
+	vipcConnID = VipcFrame.remotePathID;
+
+$IF Debugging
+	IF (vipcFrame.vipcFunctionCode <> VIPC_Px_Disconnect) 
+			AND (vipcFrame.vipcFunctionCode <> VIPC_Px_Msg) THEN
+		DO;
+		CALL ConLineOut (@('Received Invalid Vipc Frame',cr,lf),29);
+		IF NOT ValidVipcConnection (vipcConnID) THEN
+			CALL ConLineOUt (@('Invalid Connection ID',cr,lf),23);
+		CALL ConLineOUt (@('Fn/remID/localID/Data:'),22);
+		CALL HexByteOUt (vipcFrame.vipcFunctionCode);
+		CALL HexOut (vipcFrame.localPathID);
+		CALL HexOut (vipcFrame.remotePathID);
+		CALL HexOut (vipcFrame.class);
+		CALL HexOut (vipcFrame.note);
+		GOTO AsyncFrameExit;
+		END;
+$ENDIF
+
+
+IF vipcFrame.vipcFunctionCode = VIPC_Px_Disconnect THEN
+  DO;
+	DCL VipcDiscReq		BASED pFrameArrived	VipcDiscReqType;
+	DCL vipcDiscResp	VipcDiscRespType;
+
+	IF (vipcConnCB.connState = VIPC_Cx_connected)
+			OR (vipcConnCB.connState = VIPC_Cx_disconnectSent)
+		THEN DO;
+
+		/* Send a disconnect response back */
+		vipcDiscResp.vipcFunctionCode = VIPC_Px_DisconnectResponse;
+		vipcDiscResp.localPathID  = vipcConnID;
+		vipcDiscResp.remotePathID = vipcConnCB.remotePathID;
+
+		Error1 = DlcWrite (
+					SIZE (VipcDiscResp),
+					@VipcDiscResp,
+					0,
+					0ffffh,
+					TRUE);			/* synchronous */
+
+		IF (vipcConnCB.connState = VIPC_Cx_connected) THEN
+			CALL ProcessDisconnect (vipcConnID, vipcDiscReq.ReasonForDisconnect);
+		END;
+
+	/* else ignore the frame: may be an error should be sent back */
+	END;
+
+ELSE IF vipcFrame.vipcFunctionCode = VIPC_Px_Msg THEN 
+	DO;
+	clientProcessID = vipcConnCB.clientProcessID;
+	pVipcIfMsg = intAllocate (
+							clientProcessID,
+							SIZE (VipcIfMsg) - 1 /* 16 byte Header*/
+								+ vipcFrame.vipcDataLength,  /* len of rcvd msg*/
+							@error);
+
+	IF error = 0 THEN
+		DO;
+		VipcIfMsg.vipcFunctionCode = VIPC_Ix_Msg;
+		VipcIfMsg.ToBeFreed = TRUE;
+		VipcIfMsg.sourcePID = vipcConnID;
+		VipcIfMsg.destPID = clientProcessID;
+
+		CALL MOVB (@vipcFrame.class,
+					@vipcIfMsg.class,
+					vipcFrame.vipcDataLength + 6);
+							/*class, note, dataLength & data */
+
+		CALL IntSend (vipcConnID,
+							clientProcessID,
+							vipcFrame.class,
+							vipcFrame.note,
+							pVipcIfMsg,
+							@error);
+
+$IF Debugging
+	IF (debugMask AND Dbits_Vipc) <> 0 THEN 
+		DO;
+		DCL msg1 	CharStr ('Cl/nt/len/ptr/data: ');
+		DCL msg2 	CharStr ('Queued to: ');
+		DCL i		WORD;
+		
+		CALL ConLineOut (@msg1, size (msg1));
+		CALL HexOut (vipcIfMsg.class);
+		CALL HexOut (vipcIfMsg.note);
+		CALL HexOut (vipcIfMsg.vipcDataLength);
+		CALL PointerOut (pVipcIfMsg);
+		DO i = 0 TO Wmin (9, vipcIfMsg.vipcDataLength-1);
+			CALL HexByteOut (vipcIfMsg.dataArea (i));
+			END;
+		CALL newline;
+		CALL ConLineOut (@msg2, size (msg2));
+		CALL HexOut (clientProcessID);
+		CALL NewLine;
+		IF error <> 0 THEN 
+			DO;
+			CALL ConLineOut (@('Error in Queueing:'), 18);
+			CALL HexOUt (error);
+			CALL NewLine;			
+			END;
+		END;
+$ENDIF
+
+		IF error <> 0 THEN 
+		 	DO;
+			CALL OsFree (pVipcIfMsg, @error1);
+$			IF Debugging
+			IF error1 <> 0 THEN
+				DO;
+					DCL msg CharStr ('Error in OsFree:');
+				CALL ConLineOut (@msg, size(msg));
+				CALL HexOut (error1);
+				CALL Newline;
+				END;
+$			ENDIF
+			END;
+		END;
+
+	IF error <> 0 THEN
+		DO;
+		DCL VipcDiscReq	VipcDiscReqType;
+
+		/* Send a disconnect to remote, and do local disconnect */
+		vipcDiscReq.vipcFunctionCode = VIPC_Px_Disconnect;
+		vipcDiscReq.localPathID  = vipcConnID;
+		vipcDiscReq.remotePathID = vipcConnCB.remotePathID;
+
+		error1 = DlcWrite (
+					SIZE (VipcDiscReq),
+					@VipcDiscReq,
+					0,
+					0ffffh,
+					TRUE);			/* synchronous */
+
+		CALL ProcessDisconnect (vipcConnID, error);
+		END;
+	END;
+
+/* Else ignore the frame */
+
+AsyncFrameExit:
+
+	frameToBeProcessed = false;
+	CALL DlcFreeReceiveBuffer;
+	CALL ReleaseBigVipcLock;
+
+END ProcessAsyncFrame;
+
+$IF Debugging
+$EJECT
+
+DECLARE
+
+	STR LITERALLY '(*) BYTE INITIAL',
+
+	LongErrMsg		STR ('Error in receiving long packet: '),
+	ShortErrMsg		STR ('Error in receiving short packet: '),
+
+	NoDCDMsg 		STR ('Signal on P-done missing'),
+	DcdDroppedMsg	STR ('P-done signal dropped'),
+	RcvTimeOutMsg	STR ('receive timeout'),
+	BadCrcMsg		STR ('bad crc'),
+	BadLengthMsg	STR ('bad length'),
+	OverRunMsg		STR ('overrun'),
+	InvalidFrameMsg	STR ('Invalid Frame, len = '),
+	OverflowMsg		STR ('Buffer Overflow'),
+
+	UnexpectedIntMsg STR ('Received other than first char interrupt'),
+	MsgOverRunMsg	STR ('** Message missed due to event overrun **'),
+	XIDdoneMsg		STR ('XID complete'),
+	XIDMismatchMsg	STR ('XID mismatch'),
+	DlcStartedMsg	STR ('Data link connected'),
+	DlcDiscMsg		STR ('Data link disconnected'),
+	TestDoneMsg		STR ('Test exchange Done'),
+	TestMismatchMsg	STR ('Test data received is not same as test data sent'),
+	OutOfBuffersMsg	STR ('Primary out of buffers during test exchange'),
+	InvalidSequenceMsg 	STR ('Invalid Seq #s-NsRcvd/Nr/NrRcvd/Ns:'),
+	ProtocolErrorMsg	STR ('*** GRiDLink Protocol Error ***', cr,lf,
+							'State/Event = '),
+	DcdStuckHighMsg	STR ('P-Done Stuck High');
+
+DECLARE	
+	PdlUnknownMsg	STR ('Error in Pdl Receive Machine'),
+	PdlProtocolMsg	STR ('Pdl Protocol Error'),
+	PdlFramingMsg	STR ('Framing Error'),
+	IllegalAckMsg	STR ('Illegal Ack Rcvd'),
+	IllegalDataMsg	STR ('Illegal Data Seq');
+	
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	PrintDlcMessage
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PrintDlcMessage: PROCEDURE (code);
+DCL (i, code)	WORD;
+
+	CALL ConCharOut (cr);
+	IF NOT Phonelink THEN 
+		DO;
+		IF (code > eNoDCD) AND (code < eShortRcvTimeOUt) 
+	   		THEN CALL ConLineOut (@longErrMsg, SIZE (longErrMsg));
+		ELSE IF (code >= eShortRcvTimeOUt) AND (code <= eUnexpectedInterrupt) 
+		   	THEN CALL ConLineOut (@shortErrMsg, SIZE (shortErrMsg));
+		END;
+	
+	IF code > Dlc_Msg_LastMessage THEN
+		DO;
+		CALL ConLineOut (@ ('unknown Code:'), 13);
+		CALL HexOut (code);
+		END;
+
+	IF Phonelink THEN DO CASE CODE;
+	/* 0 				*/	;
+	/* 1: ePdlUnknown	*/	CALL ConLineOut (@PdlUnknownMsg, SIZE (PdlUnknownMsg));
+	/* 2: ePdlProtocol	*/	CALL ConLineOut (@PdlProtocolMsg, SIZE (PdlProtocolMsg));
+	/* 3: eRcvTimeOut	*/	CALL ConLineOut (@RcvTimeOutMsg, 
+	 										SIZE (RcvTimeOutMsg));
+	/* 4: eBadCrc		*/	CALL ConLineOut (@BadCrcMsg, SIZE (BadCrcMsg));
+
+	/* 5: ePdlFraming	*/ 	CALL ConLineOut (@PdlFramingMsg, SIZE (PdlFramingMsg));
+	/* 6: eInvalidFrame*/	CALL ConLineOut (@InvalidFrameMsg, 
+												SIZE (InvalidFrameMsg));
+	/* 7: eIllegalAck		*/	CALL ConLineOut (@IllegalAckMsg, 
+						 						SIZE (IllegalAckMsg));
+	/* 8: eBufferOverflow 	*/	CALL ConLineOut (@overflowMsg,size (overflowMsg));
+	/* 9: eIllegalDataSeq	*/	CALL ConLineOut (@IllegalDataMsg, 
+												SIZE(IllegalDataMsg));
+	/* 10: eShortBadCrc		*/	CALL ConLineOut (@BadCrcMsg, SIZE (BadCrcMsg));
+	/* 11: eShortBadLength	*/  CALL ConLineOut (@BadLengthMsg, SIZE (BadLengthMsg));
+	/* 12: eShortInvalidFrame*/ 
+					CALL ConLineOut (@InvalidFrameMsg, SIZE (InvalidFrameMsg));
+	/* 13: eUnexpectedInterrut */
+					CALL ConLineOut (@UnexpectedIntMsg, size (UnexpectedIntMsg));
+	/* 14: MsgOverRun	*/	CALL ConLineOut (@MsgOverRunMsg, SIZE (MsgOverRunMsg));
+	/* 15: XIDdone		*/	CALL ConLineOut (@XIDdoneMsg, SIZE (XIDdoneMsg));
+	/* 16: XIDMismatch	*/	CALL ConLineOut (@XIDMismatchMsg, SIZE (XIDMismatchMsg));
+	/* 17: DlcStarted	*/	CALL ConLineOut (@DlcStartedMsg, SIZE (DlcStartedMsg));
+	/* 18: DlcDisc		*/	CALL ConLineOut (@DlcDiscMsg, SIZE (DlcDiscMsg));
+	/* 19: TestDone		*/	;
+	/* 20: TestMismatch	*/	;
+	/* 21: OutOfBuffers	*/	;
+	/* 22: Dlc Protocol Error */ 
+					CALL ConLineOUt (@protocolErrorMsg, size(protocolErrorMsg));
+	/* 23: Invalid Sequence Numbers */
+					CALL ConLineOUt (@invalidSequenceMsg, size (invalidSequenceMsg));
+	/* 24: DcdStuckHigh */ CALL COnLIneOut (@DcdStuckHighMsg, size(DcdStuckHighMsg));
+	END; /* case */
+	ELSE DO CASE CODE;
+	/* 0 				*/	;
+	/* 1: eNoDcd		*/	CALL ConLineOut (@NoDcdMsg, SIZE (NoDcdMsg));
+	/* 2: eDcdDropped	*/	CALL ConLineOut (@DcdDroppedMsg, 
+	 										SIZE (DcdDroppedMsg));
+	/* 3: eRcvTimeOut	*/	CALL ConLineOut (@RcvTimeOutMsg, 
+	 										SIZE (RcvTimeOutMsg));
+	/* 4: eBadCrc		*/	CALL ConLineOut (@BadCrcMsg, SIZE (BadCrcMsg));
+
+	/* 5: eBadLength	*/
+				DO;
+			 	CALL ConLineOut (@BadLengthMsg, SIZE (BadLengthMsg));
+				CALL HexOut (RxBufferCopy.RxLength);
+				CALL ConLineOut (@ (cr,lf,'Pkt is :'), 10);
+				CALL HexByteOut	(RxBufferCopy.addr);
+				CALL HexByteOut	(RxBufferCopy.cntrl);
+				CALL HexOut	(RxBufferCopy.dataLength);
+				CALL NewLine;
+                DO i = 0 TO 21;
+					CALL HexByteOut (RxBufferCopy.CcdlDataArea (i));
+					END;
+				call newline;
+				END;
+	/* 6: eInvalidFrame*/	
+	    		DO;
+				CALL ConLineOut (@InvalidFrameMsg, SIZE (InvalidFrameMsg));
+				CALL HexOut (RxBufferCopy.RxLength);
+				CALL ConLineOut (@ (cr,lf,'Pkt is :'), 10);
+				CALL HexByteOut	(RxBufferCopy.addr);
+				CALL HexByteOut	(RxBufferCopy.cntrl);
+				CALL HexOut	(RxBufferCopy.dataLength);
+				CALL NewLine;
+                DO i = 0 TO 15;
+					CALL HexByteOut (RxBufferCopy.CcdlDataArea (i));
+					END;
+				call newline;
+				END;
+	/* 7: eOverRun			*/	CALL ConLineOut (@OverRunMsg, SIZE (OverRunMsg));
+	/* 8: eBufferOverflow 	*/	CALL ConLineOut (@overflowMsg,size (overflowMsg));
+	/* 9: eShortRcvTimeOut	*/	CALL ConLineOut (@RcvTimeOutMsg, 
+												SIZE(RcvTimeOutMsg));
+	/* 10: eShortBadCrc		*/	CALL ConLineOut (@BadCrcMsg, SIZE (BadCrcMsg));
+	/* 11: eShortBadLength	*/
+				DO;
+			 	CALL ConLineOut (@BadLengthMsg, SIZE (BadLengthMsg));
+				CALL HexOut (4);
+				CALL ConLineOut (@ (cr,lf,'Pkt is :'), 10);
+				CALL HexByteOut	(RxBufferCopy.addr);
+				CALL HexByteOut	(RxBufferCopy.cntrl);
+                DO i = 0 TO 1;
+					CALL HexByteOut (RxBufferCopy.CcdlDataArea (i));
+					END;
+				call newline;
+				END;
+	/* 12: eShortInvalidFrame	*/	
+	    		DO;
+				CALL ConLineOut (@InvalidFrameMsg, SIZE (InvalidFrameMsg));
+				CALL HexOut (4);
+				CALL ConLineOut (@ (cr,lf,'Pkt is :'), 10);
+				CALL HexByteOut	(RxBufferCopy.addr);
+				CALL HexByteOut	(RxBufferCopy.cntrl);
+                DO i = 0 TO 1;
+					CALL HexByteOut (RxBufferCopy.CcdlDataArea (i));
+					END;
+				call newline;
+				END;
+
+	/* 13: eUnexpectedInterrut */
+					CALL ConLineOut (@UnexpectedIntMsg, size (UnexpectedIntMsg));
+
+	/* 14: MsgOverRun	*/	CALL ConLineOut (@MsgOverRunMsg, SIZE (MsgOverRunMsg));
+	/* 15: XIDdone		*/	CALL ConLineOut (@XIDdoneMsg, SIZE (XIDdoneMsg));
+	/* 16: XIDMismatch	*/	CALL ConLineOut (@XIDMismatchMsg, SIZE (XIDMismatchMsg));
+	/* 17: DlcStarted	*/	CALL ConLineOut (@DlcStartedMsg, SIZE (DlcStartedMsg));
+	/* 18: DlcDisc		*/	CALL ConLineOut (@DlcDiscMsg, SIZE (DlcDiscMsg));
+	/* 19: TestDone		*/	;
+	/* 20: TestMismatch	*/	;
+	/* 21: OutOfBuffers	*/	;
+
+	/* 22: Dlc Protocol Error */
+				DO;
+				CALL ConLineOUt (@protocolErrorMsg, size(protocolErrorMsg));
+				CALL HexByteOut (DlcStateInfoCopy.state);
+				CALL HexByteOut (DlcStateInfoCOpy.event);
+				CALL HexByteOut (DlcStateInfoCOpy.pollBitON);
+				END;
+	/* 23: Invalid Sequence Numbers */
+				DO;
+				CALL ConLineOUt (@invalidSequenceMsg, size (invalidSequenceMsg));
+				CALL HexByteOut (NsReceived);
+				CALL HexByteOut (Nr);
+				CALL HexByteOut (NrReceived);
+				CALL HexByteOut (Ns);
+				END;
+	/* 24: DcdStuckHigh */ CALL COnLIneOut (@DcdStuckHighMsg, size(DcdStuckHighMsg));
+				
+	END; /* case */
+	CALL NewLine;
+END PrintDlcMessage;
+$ENDIF
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcProcess:
+&
+&	Ideally we need one process for VIPC layer and one for the data link.
+&	However with memory size restrictions, we try to simulate two processes
+&	using one.	The vipc process once in a while calls the data link
+&	procedure named DataLinkProcess, and data link must do what it needs
+&	to do in in this procedure.
+&
+&	The VIPC process performs the following functions:
+&
+&		Processes asynchronous messages and disconnect requests from
+&		remote system.
+&
+&		Handles error situations like data link disconnect.
+&
+&		and Implements data link activity timeout
+&		(for dial up connections):
+&
+&	Any event is communicated to this process by means
+&	of shared variables:
+&
+&			dataLinkDied
+&			dataLinkActivity
+&			frameToBeProcessed
+&			toBeTwitched
+&
+&	whenever any of this variable is changed, the VIPC process is alerted
+&	by means of the VipcEventSemaphore.
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcProcess: PROCEDURE CLEAN;
+DCL error					WORD;
+DCL error1  				WORD;
+DCL note					WORD;
+DCL (msgCopy1, msgCopy2) 	WORD;
+DCL	msgOverRunCopy 			BOOLEAN;
+DCL maxDelayBeforeNextPoll 	WORD;
+
+	maxDelayBeforeNextPoll = 1000; 	
+		/* 100ms to start with and the data link will set it */
+
+  DO WHILE TRUE;
+	note = OsWait (VipcEventSemaphore, maxDelayBeforeNextPoll,  @Error);
+	IF error <> eTimeout THEN 
+		DO;
+
+$IF Debugging 
+		IF DlcMsg1 <> 0 THEN
+			DO;
+			DISABLE;
+			msgCopy1 = DlcMsg1;
+			msgCopy2 = DlcMsg2;
+			msgOverrunCopy = DlcmsgOverRun;
+			DlcMsg1, DlcMsg2, DlcMsgOverrun = 0;	/* also false */
+			ENABLE;
+
+			CALL PrintDlcMessage (msgCopy1);
+			IF msgCopy2 <> 0 THEN CALL PrintDlcMessage (msgCopy2);
+			IF msgOverRunCopy THEN CALL PrintDlcMessage (Dlc_Msg_MsgOverrun);
+			END;
+$ENDIF
+
+		IF frameToBeProcessed THEN CALL ProcessAsyncFrame;
+
+		IF dataLinkDied THEN
+			DO;
+			dataLinkDied = FALSE;
+			IF VipcLayerState = Vipc_Lx_SignonSent THEN
+				CALL OsSignal (signOnSemaphore, 
+				   				SignalNormal, 
+								reasonForDataLinkDeath,
+ 								@Error1);
+			CALL DisconnectAllConnections (reasonForDataLinkDeath);
+			IF (VipcLayerState = Vipc_Lx_Running)
+			 	THEN VipcLayerState = VIPC_Lx_Ready;
+			END;
+
+$IF Debugging
+		IF toBeTwitched THEN
+			DO;
+			toBeTwitched = FALSE;
+			CALL DiagnosticTwitch;
+			END;
+$ENDIF
+
+		IF phonelink AND activityTimeOut THEN
+			DO;
+			/* There has been no data link activity for activityTimeOut
+			period.  Stop the data link.  */
+
+			activityTimeOut = FALSE;
+			/* put all existing VIPC connections in disconnected state, 
+	        and notify client processes */
+$IF Debugging
+			IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+				DO;
+				DCL msg CharStr ('Data Link Activity Timeout',cr,lf);
+				CALL COnLineOut (@msg, size(msg));
+				END;
+$ENDIF
+			CALL DisconnectAllConnections (eDlcActivityTimeOut);
+			CALL DlcStop (eDlcActivityTimeOut);
+			IF (VipcLayerState = Vipc_Lx_Running)
+			 	THEN VipcLayerState = VIPC_Lx_Ready;
+			END;
+
+		END;
+	maxDelayBeforeNextPoll = DlcProcess;
+    END;	/* infinite loop */
+END VipcProcess;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcInitialize:
+&
+&	Create the Vipc Process, create semaphores
+&	and initialize the data link
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcInitialize: PROCEDURE WORD CLEAN;
+DCL error WORD;
+
+$IF Debugging
+	IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+		CALL COnLineOut (@('Activating Vipc...',cr,lf), 20);
+$ENDIF
+
+	VipcEventSemaphore = OsCreateSemaphore (@error);
+	BigVipcLock = OsCreateSemaphore (@error);
+	IF error = eOK THEN
+		DO;
+		CALL OsSignal (BigVipcLock, signalNormal, 0, @error);
+
+		VipcProcessID = OsForkProcess (
+				@RamVipcProcess,/* this calls VipcProcess */
+				55,				/* high priority */
+				FALSE,			/* uses8087 */
+				1200,			/* stackSize */
+				@Error);
+
+		IF error = eOK THEN
+			DO;
+$IF Debugging
+			IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+				CALL COnLineOut (@('Activating Data Link...',cr,lf), 25);
+			error = DlcInitialize;
+			IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+				DO;
+				CALL COnLineOut (@('Data Link Activated:'), 20);
+				CALL HexOut (error);
+				CALL Newline;
+				END;
+
+			END;
+		END;
+
+	IF (debugMask AND Dbits_MajorEvents) <> 0 THEN
+		DO;
+		CALL COnLineOut (@('Vipc Activated:'), 15);
+		CALL HexOut (error);
+		CALL Newline;
+		END;
+
+$ELSE
+			error = DlcInitialize;
+			END;
+		END;
+$ENDIF
+
+	RETURN (error);
+END VipcInitialize;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VipcTerminate:
+&
+&	Delete the Vipc Process, delete semaphores
+&	and terminate the data link.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+VipcTerminate: PROCEDURE WORD CLEAN;
+DCL error 	WORD;
+DCL dummy 	WORD;
+DCL loopCnt WORD;
+
+$IF Debugging
+	IF MajorEventsMaskSet THEN
+		DO;
+		DCL msg CharStr ('Terminating Vipc & DataLink ...',cr,lf);
+		CALL COnLineOut (@msg, size (msg));
+		END;
+$ENDIF
+
+	/* Cannot really terminate if any VIPC connections are still open.
+	On a signoff, disconnect request is sent on all vipc connections.
+	If any connection is still open then delay for 4 seconds, checking every 
+	400 ms so that applications get time to issue a detach on the connection.
+	*/
+	
+	loopCnt = 10;
+	DO WHILE (vipcConnections > 0) AND (loopCnt > 0);
+$IF 	Debugging
+		IF MajorEventsMaskSet THEN
+			DO;
+			DCL msg CharStr ('Delaying for # of Connnections open:');
+			CALL COnLineOut (@msg, size(msg));
+			CALL HexOut (VipcConnections);
+			CALL NewLine;
+			END;
+$ENDIF
+		CALL OsDelay (400);
+		loopCnt = loopCnt - 1;
+		END;
+
+	IF vipcConnections <> 0 THEN error = eSignOffIncomplete;
+	ELSE
+		DO;
+		error = DlcTerminate;
+
+$IF Debugging
+		IF MajorEventsMaskSet THEN
+			DO;
+			DCL msg CharStr ('Data Link terminated:');
+			CALL COnLineOut (@msg, size(msg));
+			CALL HexOut (error);
+			CALL NewLine;
+			END;
+$ENDIF
+		IF error = 0 THEN
+			DO;
+			CALL OsDeleteProcess (VipcProcessID, @error);
+			CALL OsDeleteSemaphore (VipcEventSemaphore, @error);
+			CALL OsDeleteSemaphore (BigVipcLock, @error);
+			END;
+		END;
+		
+$IF Debugging
+	IF MajorEventsMaskSet THEN
+		DO;
+		DCL msg CharStr ('Vipc Terminated - error/dummy:');
+		CALL COnLineOut (@msg, size(msg));
+		CALL HexOut (error);
+		CALL HexOut (dummy);
+		CALL NewLine;
+		IF SingleStepMaskSet THEN CALL PrintTimings;
+		END;
+$ENDIF
+
+	RETURN (error);
+END VipcTerminate;
+
+END Vipc2; /* module */

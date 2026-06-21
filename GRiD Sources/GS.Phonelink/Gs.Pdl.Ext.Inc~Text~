@@ -1,0 +1,59 @@
+$IF MainModule
+PdlExecuteMachine: PROCEDURE (linkNumber, sDlCB) EXTERNAL;
+	DCL linkNumber			WORD;
+	DCL sDlCB				SELECTOR;
+	END;
+$ENDIF
+
+$IF MainModule OR ActionModule
+CompleteDisc: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+CompleteSendRequest: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+FlushSendQueue: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+GenBuildPdlTransmitRequest: PROCEDURE SELECTOR EXTERNAL; END;
+
+ProtocolError: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+QueueReceive: PROCEDURE (sDlCB) EXTERNAL;
+	DCL sDlCB SELECTOR;
+	END;
+
+RandomNumber: PROCEDURE BYTE EXTERNAL; END;
+
+ReportAbort: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+ReturnSendRequest: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+SendCurUserFrame: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+ReSendCurUserFrame: PROCEDURE (sMachine) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	END;
+
+SendShortFrame: PROCEDURE (sMachine, frameType) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	DCL frameType		BYTE;
+	END;
+
+StartDiscFlushing: PROCEDURE (sMachine, reason) EXTERNAL;
+	DCL sMachine		SELECTOR;
+	DCL reason			WORD;
+	END;
+
+$ENDIF

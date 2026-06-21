@@ -1,0 +1,157 @@
+$INCLUDE (``OsIncs`Os.Type.Inc~Text~)
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	The following variables are common to the interface routines and the 
+&	interrupt service emulator process (Isep).  The Isep looks at 
+&	appropriate flags to determine if a buffer is ready for transmission
+&	OR if the receive buffer is free for receiving.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	MISCELLANOUS CONSTANTS
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL defaultActivityTimeout 	LIT '180';	/* 3 minutes = 180 seconds */
+
+DCL InitConnID  			LIT '123',  /* initial value for pdl conn token */
+    InitSeqNum  			LIT '45';   /* initial value for seq numbers    */
+
+	/* GRiD Central requires a 100ms gap between two frames for it to
+	receive it successfully,  GRiD Server requires much smaller.  The
+	default is GRiD Server, ModemStart in Modem.Plm will set it to 
+	GRiDCentralInterframeGap if necessary */
+
+DCL GRiDServerInterframeGap		LIT '25';
+DCL GRiDCentralInterframeGap	LIT '100';
+
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	GLOBAL VARIABLES declared PUBLIC for IsEmulator
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF IsEmulator
+
+DCL DlcCounters (NumOfCountersPlus1) WORD PUBLIC INITIAL (NumOfCounters,
+				0,0,0,0,0,
+				0,0,0,0,0,
+				0,0,0,0,0,
+				0,0,0,0,0,
+				0);
+
+DCL RcvTimeouts			WORD PUBLIC AT (@DlcCounters (eRcvTimeOut)),
+	CrcErrors			WORD PUBLIC AT (@DlcCounters (eBadCRC)),
+	framingErrors		WORD PUBLIC AT (@DlcCounters (eBadLength)),
+	InvalidFrames		WORD PUBLIC AT (@DlcCounters (eInvalidFrame)),
+	BufferOverflows		WORD PUBLIC AT (@DlcCounters (eBufferOverFlow)),
+	invalidSeqCnt 		WORD PUBLIC AT (@DlcCounters (eInvalidSeq)),
+	framesRcvd 			WORD PUBLIC AT (@DlcCounters (eFramesRcvd)),
+	framesSent 			WORD PUBLIC AT (@DlcCounters (eFramesSent)),
+	duplicatesRcvd		WORD PUBLIC AT (@DlcCounters (eduplicatesRcvd)),
+	totalRetries		WORD PUBLIC AT (@DlcCounters (etotalRetries)),
+	maxRetries			WORD PUBLIC AT (@DlcCounters (eMaxRetries)),
+	totalPings			WORD PUBLIC AT (@DlcCounters (etotalPings)),
+	maxPings			WORD PUBLIC AT (@DlcCounters (eMaxPings));
+	
+DCL TxBufferDesc	TxBufDescType   PUBLIC;   /* two alternating Tx buffers */
+
+DCL DummyWords      (5) WORD;
+
+/* Define Receive Buffer Areas */
+
+DCL RxLongBufferDesc	RxLongBufferDescType PUBLIC;
+DCL RxShortBufferDesc  	RxShortBufferDescType PUBLIC;
+
+DCL RxBufferFree   		BOOLEAN PUBLIC INITIAL(TRUE);  
+							/* TRUE = receive buffer is free */
+
+DCL currentState   		BYTE PUBLIC INITIAL (SxDisconnected);  
+							/* state of data link protocol */
+
+DCL lastState			BYTE PUBLIC;
+							/* state before last state change */
+
+DCL DlcProcessID		WORD PUBLIC;
+
+DCL activityTimeOutValue	WORD PUBLIC INITIAL (defaultActivityTimeOut);
+
+/* semaphore to limit # of simultaneous writes */
+DCL DlcWriteLock  WORD  PUBLIC;
+
+DCL (ConnectionID,       	/* Pdl connection token         */
+     SendSequence,       	/* seq # for next frame to send */
+     RecvSequence,       	/* seq # of last frame received */
+     AckSequence)  			/* seq # of last ack received   */
+
+     BYTE PUBLIC INITIAL(InitConnID,(InitSeqNum+1),InitSeqNum,InitSeqNum);
+
+/* semaphore to report modem attach result */
+DCL AttachComplete WORD PUBLIC;
+
+/* flag to indicate ExAttachNow event to IsE */
+DCL AttachModemNow BOOLEAN PUBLIC INITIAL (FALSE);
+
+DCL pPromVariables PTR PUBLIC,
+	promVariables BASED pPromVariables PromVariablesType;
+
+DCL interFrameGap	WORD PUBLIC INITIAL (GRiDServerInterFrameGap);
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	GLOBAL VARIABLES declared EXTERNAL for modules other than IsEmulator
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+$ELSE
+
+DCL DlcCounters (NumOfCountersPlus1) WORD EXTERNAL;
+
+DCL RcvTimeouts			WORD EXTERNAL, 
+	CrcErrors			WORD EXTERNAL, 
+	framingErrors		WORD EXTERNAL, 
+	InvalidFrames		WORD EXTERNAL, 
+	BufferOverflows		WORD EXTERNAL, 
+	invalidSeqCnt 		WORD EXTERNAL, 
+	framesRcvd 			WORD EXTERNAL, 
+	framesSent 			WORD EXTERNAL, 
+	duplicatesRcvd		WORD EXTERNAL, 
+	totalRetries		WORD EXTERNAL, 
+	maxRetries			WORD EXTERNAL, 
+	totalPings			WORD EXTERNAL, 
+	maxPings			WORD EXTERNAL; 
+	
+DCL TxBufferDesc	TxBufDescType   EXTERNAL; /* two alternating Tx buffers */
+
+DCL RxLongBufferDesc	RxLongBufferDescType EXTERNAL;
+DCL RxShortBufferDesc  	RxShortBufferDescType EXTERNAL;
+
+DCL RxBufferFree   		BOOLEAN EXTERNAL;/* TRUE = receive buffer is free */
+
+DCL currentState   		BYTE EXTERNAL;   /* state of data link protocol */
+
+DCL lastState			BYTE EXTERNAL;	 /* state before last state change */
+
+DCL DlcProcessID		WORD EXTERNAL;
+
+DCL activityTimeOutValue WORD EXTERNAL;
+
+/* semaphore to limit # of simultaneous writes */
+DCL DlcWriteLock  WORD EXTERNAL;
+
+DCL (ConnectionID,			/* Pdl connection token         */
+     SendSequence,			/* seq # for next frame to send */
+     RecvSequence, 			/* seq # of last frame received */
+     AckSequence)  			/* seq # of last ack received   */
+
+	 BYTE EXTERNAL; 
+
+/* semaphore to report modem attach result */
+DCL AttachComplete 	WORD EXTERNAL;
+
+/* flag to indicate ExAttachNow event to IsE */
+DCL AttachModemNow BOOLEAN EXTERNAL;
+
+DCL pPromVariables PTR EXTERNAL,
+	promVariables BASED pPromVariables PromVariablesType;
+
+DCL interFrameGap	WORD EXTERNAL;
+
+$ENDIF

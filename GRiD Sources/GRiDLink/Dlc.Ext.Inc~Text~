@@ -1,0 +1,103 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&   Dlc.Ext.Inc:
+&	Vipc to Data Link Layer interface routines.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF NOT Datalink
+DlcInitialize: PROCEDURE WORD EXTERNAL;  END;
+
+DlcStart: PROCEDURE (pDataLinkInfo) WORD EXTERNAL;
+	DCL pDataLinkInfo PTR;
+	END;
+
+
+DlcStop: PROCEDURE (reason) EXTERNAL;
+	DCL reason		WORD;
+	END;
+
+DlcTerminate: PROCEDURE WORD EXTERNAL;  END;
+
+
+DlcWrite: PROCEDURE (length1, pBuf1, length2, pBuf2, synchronous) WORD EXTERNAL;
+	DCL	(length1, length2) 	WORD,
+		(pBuf1, pBuf2) 		POINTER,
+		synchronous			BOOLEAN;
+	END;
+
+
+DlcFreeReceiveBuffer: PROCEDURE EXTERNAL;  END;
+
+
+DlcProcess: PROCEDURE WORD EXTERNAL; END;
+
+$IF (debugging AND GRiDLink)
+PrintErrorCnts: PROCEDURE EXTERNAL; END;
+
+SetClockSpeed: PROCEDURE (divisor) EXTERNAL;
+	DCL divisor WORD;
+	END;
+$ENDIF
+$ENDIF
+
+
+$IF DlcInterface OR CcdlAction2
+$IF Debugging
+PrintErrorCnts: PROCEDURE EXTERNAL; END;
+HaltNCatchFire: PROCEDURE EXTERNAL; END;
+$ENDIF
+
+InitializeHardware: PROCEDURE WORD EXTERNAL; END;
+
+ResetHardware: PROCEDURE EXTERNAL; END;
+
+$ENDIF
+
+$IF DlcInterface OR CcdlAction1
+DlcWriteComplete: PROCEDURE (pTxBufDesc, reasonForCompletion) EXTERNAL;
+	DCL pTxBufDesc 			PTR;
+	DCL reasonForCompletion WORD;
+	END;
+
+ResetTimer: PROCEDURE EXTERNAL; END;
+
+SetTimerValue: PROCEDURE (n) EXTERNAL;
+	DECLARE n BYTE;	/* time in seconds */
+	END;
+
+TimerExpired: PROCEDURE BOOLEAN EXTERNAL; END;
+
+$ENDIF
+
+$IF CcdlAction1
+ProcessAddressPoll: PROCEDURE EXTERNAL; END;
+
+ProcessSxConnecting: PROCEDURE EXTERNAL; END;
+
+ProcessSxConnected: PROCEDURE EXTERNAL; END;
+
+ProcessSxDisconnecting: PROCEDURE EXTERNAL; END;
+
+$ENDIF
+
+$IF CcdlAction2
+DecodeEvent: PROCEDURE (cntrl) BYTE EXTERNAL;
+	DCL cntrl BYTE;
+	END;
+
+WriteReg: PROCEDURE (reg, writeData) EXTERNAL;
+	DCL (reg, writeData) BYTE;
+	END;
+
+CCITT16: PROCEDURE (pBuffer,length) WORD EXTERNAL;
+	DCL pBuffer		PTR;
+	DCL length		WORD;
+	END;
+
+$ENDIF
+
+$IF EntryPoint
+DlcReadCounters: PROCEDURE (pLength, pBuffer) EXTERNAL;
+	DCL plength PTR;
+	DCL	pBuffer PTR;
+	END;		
+$ENDIF

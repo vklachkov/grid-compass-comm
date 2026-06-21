@@ -1,0 +1,505 @@
+$TITLE ('Phonelink Frame I/O Routines')
+$COMPACT
+$OPTIMIZE(3) SET(PdlFrameIO)
+	/* (EXPORTS RcvChRtn) removed for non debug and ROM version */
+PdlFrameIO: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	Edit History :	Refer to GRiDLink&PhoneLinkLog~Text~
+&
+&	Authors:		Monty Boyer
+&					Rajendra Shah
+&
+&	This module implements all the frame I/O calls.
+&
+&		PdlSendFrame		
+&		RcvChRtn			- called from ISR.
+&		CheckReceiveStatus
+&
+&	Other Routines:
+&
+&		FlushOutputBuffer
+&		WriteBuffered
+&		WriteDLEStuffed
+&		AccumulateCRC
+&
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$SAVE nolist
+$INCLUDE (``incs`plm.inc~text~)
+$SET (IncludeOsConstants)
+$INCLUDE (``incs`Errors.plm.inc~text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+
+$INCLUDE (Pdl.inc~text~)
+$INCLUDE (Dlc.Error.inc~text~)
+$INCLUDE (Pdl.Ext.inc~text~)
+$INCLUDE (PdlGlobals~text~)
+$RESTORE
+
+Wmin: PROCEDURE (a, b) WORD EXTERNAL;
+	DCL (a, b) WORD;
+	END;
+
+$IF debugging
+$INCLUDE (``GRiDLink`Debug.inc~text~)
+DCL DebugMask WORD EXTERNAL;
+$ENDIF
+
+
+$EJECT
+/*	FRAME FORMAT
+----------------------------------------------
+| DLE | STX |	data	| DLE | ETX |  CRC  |
+----------------------------------------------
+*/
+
+DCL DLE	 LIT'10h',
+	STX	 LIT'02h',
+	ETX	 LIT'03h';
+
+DCL  TxCRC		 	WORD;
+DCL  RxCRC			WORD;
+DCL  SendFinishTime	DWORD;
+DCL  frameLock		WORD;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&
+&	PdlFrameInitialize, PdlFrameReset
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlFrameInitialize: PROCEDURE WORD CLEAN;
+DCL error WORD;
+	error = 0;
+	frameLock = OsCreateSemaphore (@error);
+	IF error = 0 THEN CALL OsSignal (frameLock, signalNormal, 0, @error);
+	RETURN (error);
+END PdlFrameInitialize;
+
+
+PdlFrameReset: PROCEDURE CLEAN;
+DCL error WORD;
+	CALL OsDeleteSemaphore (frameLock, @error);
+END PdlFrameReset;
+
+$EJECT
+DCL outputBuffer (700) BYTE;
+DCL bufferPtr	 WORD INITIAL (0);
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	FlushOutputBuffer: 
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FlushOutputBuffer: PROCEDURE WORD CLEAN;
+DCL error WORD;
+	error = 0;
+	IF bufferPtr > 0 THEN
+		DO;
+		error = ModemWriteBuffer (@outputBuffer, bufferPtr);
+		bufferPtr = 0;
+		END;
+	RETURN (error);
+END FlushOutputBuffer;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	WriteBuffered: 
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+WriteBuffered: PROCEDURE (ch) CLEAN;
+DCL ch		BYTE;
+DCL error 	WORD;
+	outputBuffer (bufferPtr) = ch;
+	bufferPtr = bufferPtr + 1;
+	IF bufferPtr = size(outputBuffer) THEN error = FlushOutputBuffer;
+END WriteBuffered;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	PdlSendFrame: 
+&
+&	Send the frame described by the TxBufDesc.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlSendFrame: PROCEDURE (pTxBufDesc) WORD CLEAN;
+DCL pTxBufDesc PTR,
+	TxBufDesc BASED pTxBufDesc TxBufDescType;
+
+DCL (dummy, error) 		WORD;
+DCL timeSinceLastFrame	DWORD;
+
+$IF Debugging
+	IF DlcFrameIOMaskSet THEn
+		DO;
+		DCL msg CharStr ('PdlSendFrame-len1/len2:');
+		CALL ConLineOut (@msg, size (msg));
+		CALL HexOut (TxBufDesc.length1);
+		CALL HexOut (TxBufDesc.length2);
+		CALL newline;
+		END;
+$ENDIF
+
+	dummy = OsWait (frameLock, 0ffffh, @error);
+
+	/* GRiD Central requires a 100 ms delay between frames.  The variable 
+	interFrameGapRequired will be set in Modem.Plm if the baud rate is less
+	than equal to 1200 (that is the only case supported by GC */
+
+	timeSinceLastFrame = promVariables.sysCounter - SendFinishTime;
+
+	IF timeSinceLastFrame < interFrameGap THEN
+		DO;
+		dummy = OsWait (frameLock, (interFrameGap - timeSinceLastFrame),
+			 @error);
+		/* This is really an OsDelay of remaining time, since no one
+		is going to signal frameLock but this process itself after
+		sending the frame */
+		END;
+
+	/*  Write frame header  */
+	CALL WriteBuffered (DLE);
+	CALL WriteBuffered (STX);
+
+	/*  reset TxCRC. write the TxBuffer in three parts: 
+	pdlcHeader, part1 & part2  */
+	
+	TxCRC = 0;
+	CALL WriteDLEStuffed (@TxBufDesc.frameType, PdlcHeaderLength);
+	CALL WriteDLEStuffed (TxBufDesc.pPart1, TxBufDesc.length1);
+	CALL WriteDLEStuffed (TxBufDesc.pPart2, TxBufDesc.length2);
+
+	/*  Write frame trailer  */
+	CALL WriteBuffered (DLE);
+	CALL WriteBuffered (ETX);
+	CALL WriteBuffered (LOW (TxCRC));
+	CALL WriteBuffered (HIGH (TxCRC));
+
+	error = FlushOutputBuffer;
+	SendFinishTime = promVariables.sysCounter;
+
+$IF Debugging
+	IF DlcFrameIOMaskSet THEn
+		DO;
+		DCL msg CharSTr ('PdlSendFrame Error:');
+		CALL ConLineOUt (@msg, size (msg));
+		CALL HExOut (error);
+		CALL newline;
+		END;
+$ENDIF
+	
+	CALL OsSignal (frameLock, signalNormal, 0, @dummy);
+	RETURN (error);
+END PdlSendFrame;
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	WriteDLEStuffed - write a buffer of data to the modem.
+&
+&	Perform dle stuffing and CRC accumulation for the buffer data.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+WriteDLEStuffed: PROCEDURE (pBuffer, len) CLEAN;
+DCL len 	WORD,
+	pBuffer PTR,
+	buffer 	BASED pBuffer (1) BYTE;
+DCL error 	WORD;
+DCL index	WORD;
+DCL ch		BYTE;
+
+	IF len > 0 THEN DO index = 0 TO len-1;
+		ch = buffer (index);
+		TxCRC = AccumulateCRC (TxCRC, ch);
+		CALL WriteBuffered (ch);
+		IF ch = DLE THEN CALL WriteBuffered (DLE);
+		END;   /* do index  */
+
+END WriteDLEStuffed;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	AccumulateCRC
+&	Update the value of CRC by processing the current 
+&	value of Ch.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+AccumulateCRC: PROCEDURE (CRCaccumulator, ch) WORD CLEAN;
+DCL CRCaccumulator	WORD;
+DCL ch 				BYTE;
+DCL (temp, partial, index) WORD;
+
+DCL crcTable (32) WORD DATA (
+		  0,0C0C1H,0C181H,0140H,0C301H,03C0H,0280H,0C241H,
+		  0C601H,06C0H,0780H,0C741H,0500H,0C5C1H,0C481H,0440H,
+		  0,0CC01H,0D801H,1400H,0F001H,03C00H,02800H,0E401H,
+		  0A001H,06C00H,07800H,0B401H,05000H,09C01H,08801H,04400H);
+
+	temp = LOW (CRCaccumulator) XOR ch;
+	index = temp AND 0FH;
+	partial = crcTable (index);
+	index = SHR (temp,4) + 16;
+	partial = partial XOR crcTable (index);
+	CRCaccumulator = HIGH (CRCaccumulator) XOR partial;
+
+	RETURN (CRCaccumulator);
+
+END AccumulateCRC;
+
+
+$EJECT
+/*  receive frame machine states  */
+DCL FrameSearch		LIT	'0',
+	DleInSearch		LIT	'1',
+	FrameStarted	LIT	'2',
+	DleInFrame	 	LIT	'3',
+	GetCRC1			LIT	'4',
+	GetCRC2			LIT	'5';
+
+DCL pRxBuffer			POINTER,
+	RxBuffer			BASED pRxBuffer STRUCTURE (
+								RxLength	WORD,
+								buffer		(1) BYTE);
+
+DCL len		 			WORD;
+DCL usingShortRxBuffer 	BOOLEAN;
+
+DCL RcvByteCount		WORD INITIAL (0);
+
+DCL	receivedCRC			WORD;
+DCL	CRCx	  			(2) BYTE AT (@receivedCRC);
+
+DCL ReadState	 		BYTE INITIAL (frameSearch);
+
+
+RcvChRtn: PROCEDURE (incoming, pSignalled) CLEAN;
+DCL	incoming			WORD;
+DCL Rcv 				STRUCTURE (ch BYTE, error BYTE) AT (@incoming);
+DCL RcvdCh				LIT	'Rcv.ch';
+
+DCL pSignalled			POINTER,
+	signalled			BASED pSignalled BOOLEAN;
+
+DCL error				WORD;
+
+	error = 0;
+	signalled = FALSE;
+
+	IF Rcv.error <> 0 THEN error = ePdlUnknown;	
+	ELSE DO CASE ReadState;
+
+		/* CASE 0 : FrameSearch */	  
+			DO;  
+/*		  	rcvByteCount = rcvByteCount + 1; 12/20/90 wps ?? */
+		  	IF RcvdCh = DLE THEN ReadState = DleInSearch;
+			END;
+
+		/* CASE 1 : DleInSearch */
+			DO;
+/*			rcvByteCount = rcvByteCount + 1; 12/20/90 wps ?? */
+		  	IF RcvdCh = STX THEN
+				DO;   /* found start of frame */
+				ReadState = FrameStarted;
+				rcvByteCount = 0;
+				RxCRC = 0;
+				IF RxBufferFree THEN
+					DO;
+					pRxBuffer = @RxLongBufferDesc;
+					len = SIZE (RxLongBufferDesc) - 2;
+					usingShortRxBuffer = FALSE;
+					END;
+
+				ELSE
+					DO;
+					pRxBuffer = @RxShortBufferDesc;
+					len = SIZE (RxShortBufferDesc) - 2;
+					usingShortRxBuffer = TRUE;
+					END;
+				END;
+
+			ELSE IF NOT (RcvdCh = DLE) THEN ReadState = FrameSearch;
+			END;  /* of case 1 */
+
+		/* CASE 2 : FrameStarted */
+	  		DO;
+	  		IF RcvdCh = DLE THEN ReadState = DleInFrame;
+			ELSE IF rcvByteCount >= len THEN
+				DO;
+				error = eBufferOverflow;
+				BufferOVerflows = bufferOverflows + 1;
+				END;
+			/* else add byte to callers buffer */
+			ELSE
+				DO;
+				RxCRC = AccumulateCRC (RxCRC, rcvdCh);
+				RxBuffer.buffer (rcvByteCount) = rcvdCh;
+				rcvByteCount = rcvByteCount + 1;
+				END;
+  			END; 
+
+		/* CASE 3 : DleInFrame */
+	  		DO;
+			ReadState = FrameStarted;  /* presume to get more of the frame*/
+		  	IF RcvdCh = ETX 
+				THEN ReadState = GetCRC1;  /* end of frame */
+
+		  	ELSE IF RcvdCh = STX THEN
+				DO;   /* start of new frame */
+				rcvByteCount = 0;
+				RxCRC = 0;
+				framingErrors = framingErrors  + 1;
+				END;   /* start of new frame */
+
+			ELSE IF RcvdCh = DLE THEN
+				DO;
+				IF rcvByteCount >= len THEN
+					DO;
+					error = eBufferOverflow;
+					BufferOVerflows = bufferOverflows + 1;
+					END;
+				/* else add byte to callers buffer */
+				ELSE
+					DO;
+					RxCRC = AccumulateCRC (RxCRC, DLE);
+					RxBuffer.buffer (rcvByteCount) = DLE;
+					rcvByteCount = rcvByteCount + 1;
+					END;
+				END;
+
+			ELSE 
+				DO;
+				framingErrors = framingErrors + 1;
+				error = eFraming;
+				END;
+	  		END;
+
+		/* CASE 4 : GetCRC1 */
+			DO;  /* save byte read */
+			CRCx (0) = RcvdCh;
+			ReadState = GetCRC2;
+			END;  /* save byte read */
+
+		/* CASE 5 : GetCRC2 */
+			DO;  /* check received crc */
+			CRCx (1) = RcvdCh;
+			IF RxCRC = receivedCRC THEN
+				DO;
+				RxBuffer.RxLength = rcvByteCount;
+				CALL ProcessFrame (@RxBuffer, usingShortRxBuffer);
+				readState = frameSearch;
+				signalled = TRUE;
+				rcvByteCount = 0;
+				END;
+			ELSE
+				DO;  /* crc error */
+				error = eBadCRC;
+				crcErrors = crcErrors + 1;
+				END;  /* crc error */
+			END;  /* check received crc */
+
+		END;  /* CASE ReadState */
+
+	/* If a send is just completed and we are in the middle of receiving
+	a data frame, it may take as much as 10 seconds at 1200 bauds.  We do
+	not want to ping every 3 seconds in that case. So restart the timer
+	every time a character is received AND we are inside a frame. */
+	/* Conditional added and moved here from above case stmnt 12/20/90 wps ??,
+	to make it ping even when receiving noise characters regularly/frequently.*/
+	IF readState >= frameStarted THEN
+		CALL ResetTimer;
+
+	IF error <> 0 THEN 
+		DO;
+
+$IF Debugging
+		IF NOT intDrivenMaskSet THEN
+			DO;
+			DCL msg1 CharStr ('*** BAD CRC         ');
+			DCL msg2 CharStr ('*** Framing Error   ');
+			DCL msg4 CharStr ('*** Buffer Overflow ');
+			DCL msg6 CharStr ('*** Error:          ');
+
+			IF error = eBadCRC THEN CALL ConLIneOUt (@msg1, size (msg1));
+			ELSE IF error = eFraming
+				THEN CALL ConLIneOUt (@msg2, size (msg2));
+			ELSE IF error = eBufferOverflow 
+				THEN CALL ConLIneOUt (@msg4, size (msg4));
+			ELSE 
+				DO;
+				CALL ConLIneOUt (@msg6, size (msg6));
+				CALL DecimalOUt (error);
+				END;
+
+			CALL DecimalOut (ReadState);
+			CALL DecimalOUt (rcvByteCount);
+			CALL newline;
+			END;
+$ENDIF
+
+		CALL ProcessErrorInReceive (error, usingShortRxBuffer);
+		signalled = TRUE;
+		readState = frameSearch;
+		rcvByteCount = 0;
+		END;
+END RcvChRtn;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	CheckReceiveStatus 
+&
+&	If there are any characters in the modem receive fifo, feed them
+&	to the RcvChRtn
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL inputBuffer (200) BYTE;
+DCL fenceForFastPoll	LIT	'50';
+
+CheckReceiveStatus: PROCEDURE (pError) WORD CLEAN;
+DCL BytesInFIFO				WORD;
+DCL bytesRead				WORD;
+DCL bytesTobeRead			WORD;
+DCL i						WORD;
+DCL pError					POINTER;
+DCL error					BASED pError WORD;
+DCL maxDelayBeforeNextPoll	WORD;
+DCL dummy					WORD;
+
+	maxDelayBeforeNextPoll = 100;	/* 100 ms */
+
+	DO WHILE TRUE;
+
+		error = ModemGetStatus (@bytesInFIFO);
+		IF (error <> 0) OR (bytesInFIFO = 0) THEN GOTO Exit;
+
+$		IF Debugging
+		IF intDrivenMaskSet THEN GOTO Exit;
+$		ENDIF
+
+		bytesToBeRead = WMin (bytesInFIFO,  SIZE(inputBuffer));
+		bytesRead = ModemReadBuffer (@inputBuffer, bytesToBeRead, @error);	
+		IF error <> 0 THEN GOTO Exit;
+		DO i = 0 TO (bytesRead - 1);
+			CALL RcvChRtn (inputBuffer(i), @dummy);
+			END;
+		IF bytesInFIFO < fenceForfastPoll THEN GOTO Exit;
+		maxDelayBeforeNextPoll = 30;
+		END;   /* while */
+
+Exit:
+	
+$IF Debugging
+	IF (error <> 0) AND (error <> eModLossCarrier) AND (error <> eDevNotActive)
+	 THEN
+		DO;
+		DCL msg CharStr ('Unexpected error from Modem GetStatus or Read: ');
+		CALL ConLineOut (@msg, size (msg));
+		CALL ConHexOut (error);
+		CALL newline;
+		END;
+$ENDIF
+	RETURN (maxDelayBeforeNextPoll);
+END CheckReceiveStatus;
+
+END PdlFrameIO;

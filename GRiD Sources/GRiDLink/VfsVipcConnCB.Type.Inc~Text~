@@ -1,0 +1,88 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	VfsVipcConnCB.Type.Inc
+&	The connection control block is shared between Os
+&	and Vfs/Vipc.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL VfsConnection	LIT	'0',	
+	VipcConnection	LIT '1';
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vfs Connnection Control Block
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/*  The first three fields must match with VipcConnCB
+
+VfsConnCB:
+	
+	ConnCBPrefix,				** ConnCBPrefix matches with ActiveConnCBType. //
+	pDevCB			PTR,		** 00 	ptr to device cntrl block //
+	ConnType		BYTE,		** 04	is it Vfs or Vipc Conn //
+	inUseSema		WORD,		** 05	smphr to allow only 1 otstndng req/conn //
+	RespReceived	WORD,		** 07	smphr usd by to wake up waiting process 
+										upon arrival of vfs response //
+	serversConnID	WORD,		** 09	connID allctd by VFS mngr on rmt systm //
+	accessType		BYTE,		** 11	save type of access //
+	respExpected 	BOOLEAN,	** 12	true when resonse is expected //
+	open			BOOLEAN,	** 13	open status of conn maintained here //
+	pPage			PTR,		** 14	pointer to read ahead buffer/page //
+	pageDirty		BOOLEAN,	** 18	denotes changes in page //
+	pageRead		BOOLEAN,	** 19	indicates page has been read //
+	locFile			DWORD,		** 20	abs location - not used yet //
+	locBuffer		WORD,		** 24	location in current page //
+	lenBuffer		WORD,		** 26	length of page read //
+	priority		BYTE,		** 28	used to store orgnl prrty of cur process//
+	VipcConnID		WORD;		** 29	pathID for IPC conn used by VFS //
+	DeviceInADT		BOOLEAN		** 30	is true if device of path name is in ADT//
+	numBuf			BYTE,		** 31	number of buffers for read ahead //
+	detached		BOOLEAN		** 32   used to ignore detach after delete //
+	direction		BYTE,		** 33   maintains direction of read //
+	DirObjectsPerPage	BYTE,	** 34 	used only in object mode //
+	seqNumber		WORD		** 35	vfs request seq number //
+								** 37 	bytes used in WorkSpace //
+								** this should not be more than 40 //
+*/
+
+DCL VfsConnCBType LIT 'STRUCTURE (ConnCBPrefix, VfsConnCBPart1, VfsConnCBPart2)';
+
+	DCL VfsConnCBPart1 AS 'pDevCB PTR, ConnType BYTE, inUseSema WORD, 
+		RespReceived WORD, serversConnID WORD, accessType BYTE, 
+		respExpected BOOLEAN, open BOOLEAN, pPage PTR';
+
+	DCL VfsConnCBPart2 AS 'pageDirty BOOL, pageRead BOOL, locFile DWORD,
+		locBuffer WORD, lenBuffer WORD, priority BYTE, VipcConnID WORD,
+		DeviceInADT BOOL, numBuf BYTE, detached BOOL, direction BYTE,
+		dirObjectsPerPage BYTE, seqNumber WORD';
+
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Vipc Connnection Control Block 
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF Comment
+DCL VipcConnCBType AS
+		/*  The first three fields must match with VfsConnCB */
+
+		connCBPrefix,						see comments under vfs
+		pDevCB				PTR,		00	ptr to device cntrl block
+		connType			BYTE, 		04	is it Vfs or Vipc Conn
+		inUseSema			WORD,		05	semaphore to limit requests
+		respReceived		WORD,		07	sem for synchronoust calls
+		remotePathID		WORD,		09	remote part path ID connection
+		clientIsVFS			BOOLEAN,	11	Vfs is a special client of VIPC
+		VfsConnections		WORD,		12	number for vfs connections
+		clientProcessID 	WORD,		14	processID of client using this IPC 
+											path, if it is not VFS
+		connState			BYTE,		16	maintain the state of an IPC path
+		reasonForDisconnect	WORD,		17	error code for disconnected state
+		activityTimeOut		WORD		19	activity timeout for this connection
+										21  this should not exceed 40
+$ENDIF									
+DCL VipcConnCBType AS 'STRUCTURE (connCBPrefix,	pDevCB	PTR,
+		connType BYTE, inUseSema WORD, respReceived WORD,
+		remotePathID WORD, clientIsVFS BOOLEAN, VfsConnections WORD,
+		clientProcessID WORD, connState BYTE, reasonForDisconnect WORD,
+		activityTimeOut WORD)';
+

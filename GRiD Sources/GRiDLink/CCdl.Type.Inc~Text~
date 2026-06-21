@@ -1,0 +1,64 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Ccdl.Type.Inc: Data Types for Ccdl
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE
+
+TxBufDescType LIT 
+	'STRUCTURE (ReadyForTx BOOLEAN, synchronous BOOLEAN, Addr BYTE, Cntrl BYTE,
+	IfieldLength WORD, length1 WORD, pPart1 PTR, length2 WORD, pPart2 PTR,
+	writeComplete WORD, txAttempts WORD)';
+
+/*
+   		ReadyForTx		BOOLEAN,	** true when buf desc set up for tx //
+   		Synchronous		BOOLEAN,	** true when DlcWrite is waiting fr completion //
+   		Addr			BYTE,		** Station Address Field //
+   		CNtrl			BYTE,		** Cntrl Field in SDLC frame //
+   		IfieldLength	WORD,		** length of I-field (-2) in SDLC frame //
+		length1			WORD,		** length of 1st part //
+		pPart1			PTR,		** ptr to 1st part of frame //
+		length2			WORD, 		** length of 2nd part //
+		pPart2			PTR,		** ptr to 2nd part of frame //
+		writeComplete 	WORD,		** Semaphore for write completion //
+		txAttempts		WORD),		** number of tx before acked //
+*/
+
+DCL SdlcPart LIT 
+		'Addr			BYTE,
+		cntrl			BYTE,
+		dataLength		WORD';
+
+
+DCL	RxMaxFrameSize	LIT '550';
+DCL	RxBufDescType LIT 
+		'STRUCTURE (
+			RxLength						WORD,	/* actual length of frame rcvd */
+			sdlcPart,
+			CcdlDataArea (RxMaxFrameSize)	BYTE,
+			free							WORD)';	/*	I don't remember why I am 
+														using this field */
+
+DCL OverflowRxBufDescType LIT 
+		'STRUCTURE (
+			RxLength						WORD,
+			sdlcPart,
+			DataArea (4)					BYTE)';
+
+
+DCL RxXIDBUfferType LIT 
+		'STRUCTURE(
+			RxLength 	WORD,
+			sdlcPart,
+			Type		BYTE,
+			RxMachineID (4) WORD,
+			NewAddress	BYTE,
+			error		WORD,
+			CRC			WORD) ';
+
+
+DCL TxXIDBufferType LIT 
+		'STRUCTURE (
+			Type	BYTE,
+			TxMachineID  (4) WORD,
+			reqdAddress	 BYTE) ';
+

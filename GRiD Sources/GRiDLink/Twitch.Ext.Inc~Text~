@@ -1,0 +1,15 @@
+TurnTwitchOn: PROCEDURE DWORD EXTERNAL; END;
+TurnTwitchOff: PROCEDURE (twitchState) EXTERNAL; 
+	DCL	twitchState	DWORD;
+	END;
+
+$IF Debugging
+DiagnosticTwitch:	PROCEDURE EXTERNAL; END;
+$ENDIF
+
+$IF oldCOde
+TurnTwitchOn:		PROCEDURE EXTERNAL; END;
+TurnTwitchOff:		PROCEDURE EXTERNAL; END;
+Twitch: 			PROCEDURE EXTERNAL; END;
+$ENDIF
+

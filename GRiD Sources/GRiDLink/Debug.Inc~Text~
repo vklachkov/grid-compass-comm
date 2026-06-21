@@ -1,0 +1,152 @@
+$IF EntryPOint
+DCL DebugMask WORD PUBLIC INITIAL (0001h);
+		/* Debugging Code: individual bits turn on 
+		debugging information display */
+
+DCL DbgMasks CharStr (cr,lf,
+'DEBUG MASK BITS (0 to 15):',cr,lf,
+lf,
+'    0001    bit 0  - Data Link Error Conditions only.',cr,lf,
+$IF PhoneLink
+'    0002    bit 1  - Pdl IO Events',cr,lf,
+'    0004    bit 2  - Pdl Frame IO',cr,lf,
+$ENDIF
+lf,
+'    0008    bit 3  - Major Events.',cr,lf,
+'    0010    bit 4  - Major Events 2.',cr,lf,
+lf,
+$IF phonelink
+'    0040    bit 6  - interrupt driven',cr,lf,
+'    0080    bit 7  - set baud rate',cr,lf,
+lf,
+$ENDIF
+'    0100    bit 8  - File System Attach & Detach.',cr,lf,
+'    0200    bit 9  - All file system calls.',cr,lf,
+'    0400    bit 10 - Detailed pipe lined calls.',cr,lf,
+lf,
+'    1000    bit 12 - connects & disconnects',cr,lf,
+'    2000    bit 13 - sends and receives',cr,lf,
+lf,
+'    4000    bit 14 - timing in single step mode',cr,lf,
+'    8000    bit 15 - single step mode',cr,lf,
+lf,
+'Enter Debug Mask: ');
+$ENDIF
+
+/* Miscellaneous debugging constants & externals */
+
+DCL	/* Bits for Debug mask */
+
+
+/*	DBits_DlcBoundaryConditions	AS	'0001h',*/
+	DBits_DlcIOTrace			AS  '0002h',
+	DBits_DlcFrameIO			AS  '0004h',
+
+	DBits_DlcEvents				AS	'0008h',
+	DBits_MajorEvents			AS	'0008h',
+	DBits_MajorEvents2			AS	'0010h',
+
+	DBits_intDriven				AS	'0040h',
+	DBits_OwnBaudRate			AS  '0080h',
+
+	DBits_FsAttach			  	AS	'0300h',
+	DBits_Fs			  		AS	'0200h',
+	DBits_DetailedFs			AS	'0200h',
+	DBits_FsPipeline			AS	'0400h',
+	DBits_FsLongRead			AS	'0400h',
+	DBits_DeviceTable			AS	'0800h',
+
+	DBits_Vipc					AS	'1000h',	/* Connects, Disconnects */
+	DBits_VipcMsg				AS	'2000h',	/* Sends and Receives */
+
+	DBits_Timing				AS	'4000h',	/* timing in fs and ipc calls */
+	DBits_SingleStep			AS	'8000h',	/* Enables Single Stepping */
+
+	DBits_Error					AS	'8000h';	/* not used */
+
+DCL DlcErrorsMaskSet 	LIT '((DebugMask AND 0009h) <> 0)';
+DCL DlcBoundaryMaskSet	LIT '((DebugMask AND Dbits_DlcBoundaryConditions)<>0)';
+DCL DlcIOTraceMaskSet	LIT '((DebugMask AND DBits_DlcIOTrace) <> 0)';
+DCL DlcFrameIOMaskSet	LIT '((DebugMask AND DBits_DlcFrameIO) <> 0)';
+
+DCL DlcEventsMaskSet	LIT '((DebugMask AND Dbits_DlcEvents) <> 0)';
+DCL MajorEventsMaskSet	LIT 'DlcEventsMaskSet';
+DCL MajorEvents2MaskSet	LIT '((DebugMask AND Dbits_MajorEvents2) <> 0)';
+
+DCL OwnBaudRateMaskSet	LIT '((DebugMask AND Dbits_OwnBaudRate) <> 0)';
+DCL intDrivenMaskSet	LIT '((DebugMask AND Dbits_intDriven) <> 0)';
+
+DCL FsAttachMaskSet		LIT	'((DebugMask AND Dbits_FsAttach) <> 0)';
+DCL FsMaskSet			LIT	'((DebugMask AND Dbits_Fs) <> 0)';
+DCL DetailedFsMaskSet	LIT	'FsMaskSet';
+
+$IF notUsed
+DCL FsPipeLineMaskSet	LIT	'((DebugMask AND Dbits_FsPipeLine) <> 0)';
+DCL FsLongReadMaskSet	LIT	'FsPipelineMaskSet';
+DCL FsDeviceTableMaskSet LIT '((DebugMask AND Dbits_FsDeviceTable) <> 0)';
+$ENDIF
+
+DCL VipcMaskSet			LIT	'((DebugMask AND Dbits_Vipc) <> 0)';
+DCL VipcMsgMaskSet		LIT	'((DebugMask AND Dbits_VipcMsg) <> 0)';
+
+DCL TimingMaskSet		LIT	'((DebugMask AND Dbits_Timing) <> 0)';
+DCL SingleStepMaskSet	LIT	'((DebugMask AND Dbits_SingleStep) <> 0)';
+
+DCL ErrorMaskSet		LIT	'((DebugMask AND Dbits_Error) <> 0)';
+
+PointerOut: PROCEDURE (p) EXTERNAL;
+	DCL p PTR;
+	END;
+
+SelectorOut: PROCEDURE (s) EXTERNAL;
+	DCL s SELECTOR;
+	END;
+
+HexDwordOut: PROCEDURE (dW) EXTERNAL;
+	DCL dW DWORD;
+	END;
+
+HexOut: PROCEDURE (b) EXTERNAL;
+	DCL b WORD;
+	END;
+
+HexByteOut: PROCEDURE (b) EXTERNAL;
+	DCL b BYTE;
+	END;
+
+HexToChar: PROCEDURE (h) BYTE EXTERNAL;
+	DCL h BYTE;
+	END;
+
+NewLine: PROCEDURE EXTERNAL; END;
+
+InitTiming: PROCEDURE EXTERNAL; END;
+
+SetStartTime: PROCEDURE EXTERNAL; END;
+
+SetStopTime: PROCEDURE EXTERNAL; END;
+
+PrintTimings: PROCEDURE EXTERNAL; END;
+
+/* This is from Console.ext.inc */
+
+ConLineOut : PROCEDURE (pBuf, length) EXTERNAL;
+    DCL pBuf PTR;
+    DCL length WORD;
+    END;
+
+ConHexOut : PROCEDURE (num) EXTERNAL;
+    DCL num WORD;
+    END;
+
+ConCharOut : PROCEDURE (char) EXTERNAL;
+    DCL char BYTE;
+    END;
+
+ConCharIn : PROCEDURE BYTE EXTERNAL; END;
+
+DecimalOut: PROCEDURE (n) EXTERNAL; 
+	DCL n DWORD;
+	END;
+
+ConResetDisplay: PROCEDURE EXTERNAL; END;

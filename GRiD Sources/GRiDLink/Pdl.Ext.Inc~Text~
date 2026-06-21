@@ -1,0 +1,93 @@
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+& Publics from All Phone Data Link Modules
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+& Publics from IsEmulator
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF NOT IsEmulator
+
+IsMain: 		PROCEDURE WORD EXTERNAL; END;
+StartRfc: 		PROCEDURE EXTERNAL; END;
+StartDataFrame: PROCEDURE EXTERNAL; END;
+ResetTimer: 	PROCEDURE EXTERNAL; END;
+TurnTimerOff: 	PROCEDURE EXTERNAL; END;
+TimerExpired: 	PROCEDURE BOOLEAN EXTERNAL;END;
+
+DisconnectDlc: PROCEDURE (reason) EXTERNAL;
+	DCL reason WORD;
+	END;
+
+SetTimer: PROCEDURE (n) EXTERNAL;
+	DCL n WORD;
+	END;
+
+ProcessErrorInReceive: PROCEDURE (error, usingShortRxBuffer) EXTERNAL;
+	DCL error				WORD;
+	DCL usingShortRxBuffer	BOOLEAN;
+	END;
+
+ProcessFrame: PROCEDURE (pRxBuffer, usingShortRxBuffer) EXTERNAL;
+	DCL pRxBuffer			POINTER;
+	DCL usingShortRxBuffer	BOOLEAN;
+	END;
+
+$ENDIF
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Publics from ModemInterface
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF NOT ModemInterface
+ModemInitialize: 	PROCEDURE WORD EXTERNAL; END;
+ModemReset: 		PROCEDURE EXTERNAL; END;
+
+ModemAttach: 		PROCEDURE WORD EXTERNAL;END;
+ModemStop: 			PROCEDURE EXTERNAL;END;
+      
+ModemStart: PROCEDURE (pDataLinkInfo) WORD EXTERNAL;
+  DCL pDataLinkInfo PTR,
+      pError PTR;
+  END;
+
+ModemGetStatus:	PROCEDURE (pBytesInFifo) WORD EXTERNAL;
+	DCL pBytesInfifo	PTR;
+	END;
+
+ModemWriteBuffer: PROCEDURE (pBuffer, length) WORD EXTERNAL;
+	DCL pBuffer		PTR;
+	DCL length		WORD;
+	END;
+
+ModemReadBuffer: PROCEDURE (pBuffer, length, pError) WORD EXTERNAL;
+	DCL (pBuffer, pError)	PTR;
+	DCL length	WORD;
+	END;
+
+$ENDIF
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Publics from PdlFrameIO
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$IF NOT PdlFrameIO
+PdlFrameInitialize: PROCEDURE WORD EXTERNAL; END;
+PdlFrameReset: PROCEDURE EXTERNAL; END;
+
+PdlSendFrame: PROCEDURE (pTxBufDesc) WORD EXTERNAL;
+  DCL pTxBufDesc PTR;
+  /*  TxBufDesc BASED pTxBufDesc TxBufDescType */
+  END;
+
+CheckReceiveStatus: PROCEDURE (pError) WORD EXTERNAL; 
+	DCL pError		POINTER;
+	END;
+
+RcvChRtn: PROCEDURE (incoming, pSignalled) EXTERNAL;
+	DCL	incoming	WORD;
+	DCL pSignalled	POINTER;
+	END;
+$ENDIF
+

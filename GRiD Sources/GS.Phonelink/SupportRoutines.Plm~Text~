@@ -1,0 +1,529 @@
+$TITLE ('Compass Central Phone Data Link: Action Module 1')
+$COMPACT OPTIMIZE(3)
+$SET(phoneLink) SET(ActionSupportModule)
+
+PdlActionSupportModule: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*
+*				COMPASS CENTRAL Phone DATA LINK CONTROL
+*
+*	This module contains the following action action support routines:
+*
+*			tbd
+*
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+
+$SAVE NOLIST
+$INCLUDE (``Incs`Plm.Inc~Text~)
+$INCLUDE (``Incs`OsPlmProcs.Inc~Text~)
+$INCLUDE (``Incs`ConPlmProcs.Inc~Text~)
+$INCLUDE (``Incs`MovRtns.Plm.Inc~Text~)
+
+$INCLUDE (``ccIncs`DataCommDefines.inc~text~)
+$INCLUDE (``ccIncs`MachineDefines.Inc~Text~)
+
+$INCLUDE (PdlConstants.Inc~Text~)
+$INCLUDE (PdlMachineDefines.Inc~Text~)
+$INCLUDE (NewErrors.Inc~Text~)
+
+$INCLUDE (SelectedDlcActions.inc~text~)
+$INCLUDE (SelectedGeneral.inc~text~)
+
+$INCLUDE (``ccIncs`DlcMsgDefines.inc~text~)
+$INCLUDE (``ccIncs`MemoryDefines.inc~text~)
+$INCLUDE (``ccIncs`MacModule.inc~text~)
+$INCLUDE (``ccIncs`UtlModule.inc~text~)
+$INCLUDE (``ccIncs`TimerModule.inc~text~)
+
+DCL	eModLossCarrier	LIT	'402';
+
+$IF Debug
+CrLf: PROCEDURE;
+	CALL ConLineOut(@(cr, lf), 2);
+END CrLf;
+$ENDIF
+$RESTORE
+$INCLUDE (GlobalVariables~Text~)
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	CompleteDisc:  
+*
+*	A disc is sent,  return the User's DiscRequest and change the state to
+*	closed.
+*				
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+CompleteDisc: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sDlCB			SELECTOR;
+
+$IF Debug
+	CALL ConLineOut (@('Completing Disconnect, link#'), 28);
+	CALL ConHexOut (machine.linkNumber);
+	CALL CrLf;
+$ENDIF
+
+	CALL GenReturnUserRequest (sMachine, machine.userRequestCB, eOk);
+	machine.userRequestCB = nullword;
+	machine.nextState = PdlSxClosed;
+	machine.active = false;
+
+END CompleteDisc;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	CompleteSendRequest
+*		return currrent send request
+*		if any error 
+*	 		then flush rest of send requests from send queue
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+CompleteSendRequest: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sSendDlCB		SELECTOR,
+	SendDlCB		BASED sSendDlCB STRUCTURE (DlCBgenDescriptor);
+
+	machine.sendOutStanding,
+	machine.ackOutStanding,
+	machine.resendRequired = FALSE;
+
+	IF NOT machine.pingSent THEN
+		CALL ReturnSendRequest(sMachine);
+	ELSE
+		machine.pingSent = FALSE;
+
+	IF machine.flushing THEN
+		CALL FlushSendQueue (sMachine);
+	ELSE
+		IF (machine.sSendDlcB:= UtlPopQ (@machine.sendQHead)) <> nullword THEN
+		DO;
+		    /* I do not want MAC to free my message. So i will save
+			freeDisp and set freeDisp to returnMsg. */
+			sSendDlcB = machine.sSendDlcB;
+			machine.freeDisp = sendDlCB.freeDisp;
+			sendDlCB.freeDisp = returnMsg;		
+			CALL SendCurUserFrame (smachine);
+		END;
+	ELSE
+		DO;
+			machine.pollTimerOn = TRUE;
+			CALL TmrStartPollTimeout(sMachine);
+			activityTimerCount = 0;
+$IF Debug
+			CALL ConLineOut(@('Started poll timer', cr, lf), 20);
+$ENDIF
+		END;
+
+END CompleteSendRequest;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	FlushSendQueue:
+*
+*	This routinge will be called by StartDiscFlushing if no send data is
+*	outstanding with MAC.  Otherwise it will be called by CompleteSend
+*	when MAC returns that send request.
+*
+*	If the flush request was initiated by a local flush request, then Dlc 
+*	abort should not be sent to User.   
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+FlushSendQueue: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL reason			WORD;
+
+DCL sDlCB			SELECTOR;
+
+	DO WHILE (sDlCB := UtlPopQ (@machine.sendQhead)) <> NULLWORD;
+		CALL GenReturnUserRequest (sMachine, sDlCB, machine.irrecError);
+	END;
+
+	IF (sDlCB := machine.userFlushCB) <> NULLWORD THEN
+	DO;
+		/* Is DlcFlush request has arrived and is pending, so send
+			a response back. Also set userFlushed. */
+
+		CALL GenReturnUserRequest (sMachine, sDlCB, eOk);
+		machine.userFlushCB = nullword;
+		machine.userFlushed = TRUE;
+	END;
+
+	/* If the disc connect was initiated locally then an
+		abort does not need to be reported.  The flag 
+		'abortReported' will be set by routines that initiate 
+		local disconnect */
+
+	IF NOT machine.abortReported THEN
+	DO;
+		CALL ReportAbort (sMachine);
+		machine.abortReported = TRUE;
+	END;
+
+$IF Debug
+	CALL ConLineOut(@('Flushed send queue', cr, lf), 20);
+$ENDIF
+
+	machine.flushing = FALSE;
+
+END FlushSendQueue;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*						GenBuildPdlTransmitRequest
+*
+*	Get a 32 byte buffer from private pool of small buffers to avoid
+&	fragmentation problems.  Fill in some of the control fields.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+
+GenBuildPdlTransmitRequest: PROCEDURE SELECTOR CLEAN;
+
+DCL sPdlShortFrame	SELECTOR,
+	pdlShortFrame	BASED sPdlShortFrame STRUCTURE (DlCBgenDescriptor);
+
+	sPdlShortFrame = UtlBuildCB;
+	pdlShortFrame.msgformat = macFrameOUt OR msgRequest;
+	pdlShortFrame.freeDisp = returnMsg;
+	pdlShortFrame.ipcCode = msgNetworkIo;
+	pdlShortFrame.destPid = nullword;
+	pdlShortFrame.sourcePid = OsWhoAmI;
+
+	RETURN (sPdlShortFrame);
+
+END GenBuildPdlTransmitRequest;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	ProtocolError:
+*	This routine is called for all protocol errors,  This routine will
+*	essentially shut down the data link.
+*
+*	log the error.
+*	if userRequest then return it.
+*
+*	IF in connected state then
+*		start disc flushing
+*		report disconnected
+*	else
+*		state = SxClosed.
+*	
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ProtocolError: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sDlCB			SELECTOR;
+
+	CALL OsLogError(2, eDlcProtocolError, machine.linkNumber,
+														@(10, 'Pdl sup 01'));
+$IF Debug
+	CALL ConLineOut(@('Protocol error, link#: '), 23);
+	CALL ConHexOut(machine.linkNumber);
+	CALL CrLf;
+$ENDIF
+	IF (sDlCB := machine.userRequestCB) <> NULLWORD THEN
+	DO;
+		machine.userRequestCB = NULLWORD;
+		CALL GenReturnUserRequest (sMachine, sDlCB, eDlcProtocolError);
+	END;
+
+	IF machine.state = PdlSxConnected THEN
+	DO;
+		machine.nextState = PdlSxDisconnecting;
+		CALL StartDiscFlushing (sMachine, eDlcProtocolError);
+	END;
+	ELSE 
+	 	DO;
+			CALL MacDisablePoll(machine.linkNumber);
+			machine.nextState = PdlSxClosed;
+			machine.active = FALSE;
+		END;
+
+END ProtocolError;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	QueueReceive: Queue Receive Buffer
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+QueueReceive: PROCEDURE (sDlCB) CLEAN;
+DCL sDlCB 	SELECTOR,
+	dlCB	BASED sDlCB STRUCTURE (DlCBgenDescriptor);
+
+	dlCB.sourcePID, dlCB.destPID = OsWhoAmI;
+	dlCB.msgFormat = macFrameReceive;
+	CALL MacReceiveFrame (sDlcB);
+
+END QueueReceive;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	RandomNumber
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DCL RandomValue WORD INITIAL (5);
+
+RandomNumber: PROCEDURE BYTE PUBLIC;
+
+	RandomValue = 2005 * RandomValue + 4227;
+	RETURN LOW (RandomValue);
+
+END RandomNumber;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	ReportAbort:
+*	This routine is called for all protocol errors,  This routine will
+*	essentially shut down the data link.
+*
+*	log the error.
+*	if userRequest then return it.
+*
+*	IF in connected state then
+*		start disc flushing
+*		report disconnected
+*	else
+*		state = SxClosed.
+*	
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ReportAbort: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sDlCB			SELECTOR,
+	dlCB			BASED sDlCB	STRUCTURE (DlCBGenDescriptor, DlCBioDataParams);
+
+$IF Debug
+	CALL ConLineOut (@('Reporting Abort, link#'), 22);
+	CALL ConHexOut (machine.linkNumber);
+	CALL CrLf;
+$ENDIF
+	
+	sDlCB = UtlBuildCB;
+	dlCB.msgFormat = (dlcAbort OR msgResponse);
+	dlCB.linkNumber = machine.linkNumber;
+	dlCB.stationNumber = 0;
+	dlCB.sourcePid = machine.userPID;
+	CALL GenReturnUserRequest (sMachine, sDlCB, machine.irrecError);
+
+END ReportAbort;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	ReturnSendRequest
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ReturnSendRequest: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sSendDlCB		SELECTOR,
+	SendDlCB		BASED sSendDlCB STRUCTURE (DlCBgenDescriptor);
+
+	sSendDlCB = machine.sSendDlCB;
+
+	/* Before giving the frame to Mac the freeDisp was set to 
+			returnMsg.  Set it back to its original value */
+
+	sendDlCB.freeDisp = machine.freeDisp;
+	sendDlCB.msgFormat = DlcSend;
+	CALL GenReturnUserRequest(sMachine, sSendDlCB, sendDlCB.reqError);
+
+END ReturnSendRequest;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	SendCurUserFrame
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+SendCurUserFrame: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sDataDlCB		SELECTOR,
+	dataDlCB		BASED sDataDlCB STRUCTURE
+									(DlCBgenDescriptor,
+									DlCBioDataParams);
+DCL pDataBuffer		PTR,
+	dataBuffer		BASED pDataBuffer STRUCTURE
+										(pdlcHeader,
+										dataArea (1) BYTE);
+
+DCL pdlcheaderPart BASED sDummy STRUCTURE (PdlcHeader);
+
+	sDataDlcB = machine.sSendDlCB;
+	machine.sendOutstanding = TRUE;
+	machine.ackOutstanding = TRUE;
+	machine.currentRetries = 0;
+	dataDlCB.msgFormat = macFrameOutInfo OR msgRequest;
+	dataDlCB.sourcePid = OsWhoAmI;
+
+	IF (dataDlCB.dataLength AND bufferTypeMask) = msgWithBufferPtr THEN
+		pDataBuffer = dataDlCB.pBuffer;
+	ELSE
+		pDataBuffer = @dataDlCB.pBuffer;
+
+	dataDlCB.dataLength = dataDlCB.dataLength + SIZE (pdlcHeaderPart);
+	dataBuffer.seqNumber = (machine.vS := machine.vS+1);
+	dataBuffer.frameType = dataType;
+	dataBuffer.flags = EomFlagOn;
+
+	CALL MacTransmitFrame (sdataDlCB);
+
+END SendcurUserFrame;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	ReSendCurUserFrame
+*   most of the information is set up, only set msgFormat and sourcePid.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+ReSendCurUserFrame: PROCEDURE (sMachine) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sDataDlCB		SELECTOR,
+	dataDlCB		BASED sDataDlCB STRUCTURE
+									(DlCBgenDescriptor,
+									DlCBioDataParams);
+DCL pdlcheaderPart BASED sDummy STRUCTURE (PdlcHeader);
+
+	sDataDlcB = machine.sSendDlCB;
+	machine.sendOutstanding = TRUE;
+	dataDlCB.msgFormat = macFrameOutInfo OR msgRequest;
+	dataDlCB.sourcePid = OsWhoAmI;
+
+	CALL MacTransmitFrame (sdataDlCB);
+
+END ReSendcurUserFrame;
+
+				    
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	SendShortFrame:
+&	called by SendAck, SendPing, SendDisc
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+SendShortFrame: PROCEDURE (sMachine, frameType) CLEAN;
+
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL sShortFrame		SELECTOR,
+	shortFrame		BASED sShortFrame STRUCTURE
+										(DlCBGenDescriptor,
+										DlCBioDataParams);
+
+DCL pBuffer			PTR,
+	Buffer			BASED	pBuffer	STRUCTURE 
+	  									(PdlcHeader,
+										connectionID BYTE,
+						                version (2)  BYTE);
+DCL frameType		BYTE;
+
+	sShortFrame = GenBuildPdlTransmitRequest;
+	shortFrame.linkNumber = machine.linkNumber;
+	pBuffer = @shortFrame.pBuffer;
+
+	buffer.frameType = frameType;
+	IF (frameType = rfcType) and machine.activeConnect THEN
+	DO;
+		buffer.flags, buffer.seqNumber, buffer.connectionID, buffer.windowSize,
+						buffer.version(0), buffer.version(1) = rfcFiller;
+		shortFrame.dataLength = SIZE (buffer) OR msgNoBufferPtr;	/* 7 */
+	END;
+	ELSE
+		DO;
+			buffer.flags = EomFlagOn;
+			buffer.connectionID = machine.connectionID;
+			/* changed from always vR 5/3/89 by W. Strang */
+			IF frameType = AckType THEN
+				buffer.seqNumber =  machine.vR;
+			ELSE
+				buffer.seqNumber =  machine.vS;
+			IF frameType = rfcType THEN 
+			DO;
+				buffer.version (0) = '0';
+				buffer.version (1) = '2';
+				shortFrame.dataLength = SIZE (buffer) OR msgNoBufferPtr; /* 7 */
+			END;
+			ELSE
+				shortFrame.dataLength = (SIZE(buffer) - 2) OR msgNoBufferPtr;
+																		/* 5 */
+		END;
+	CALL MacTransmitFrame (sShortFrame);
+END SendShortFrame;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	StartDiscFlushing:
+* 	This routine will be called in one of the following cases:
+*
+*	In connected state:
+*		o	A protocol error occurs
+*		o	A disconnect is received from remote
+*		o   A flush request is received
+*
+*	Algorithm:
+*		o	Send a disc.
+*		o   If no send data request is outstanding with MAC start flushing.
+*		
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+StartDiscFlushing: PROCEDURE (sMachine, reason) CLEAN;
+DCL sMachine		SELECTOR,
+	machine			BASED sMachine	PdlStateMachineType;
+
+DCL reason			WORD;
+
+$IF Debug
+	CALL ConLineOut(@('Started Disc flush', cr, lf), 20);
+$ENDIF
+
+	CALL TmrAbortTimeout (sMachine, tmrPollTimer);
+$IF Debug
+	CALL ConLineOut(@('Aborted poll timer', cr, lf), 20);
+$ENDIF
+
+	CALL TmrAbortTimeOut (sMachine, tmrResponseTimer);
+$IF Debug
+	CALL ConLineOut(@('Aborted resp timer', cr, lf), 20);
+$ENDIF
+	machine.nextState = PdlSxDisconnecting;
+	machine.irrecError = reason;
+	machine.flushing = TRUE;
+	machine.userFlushed, machine.discXmitCompleted = FALSE;
+	IF (reason <> eModLossCarrier) AND (reason <> eDlcRemoteClosed) THEN
+		CALL SendShortFrame (sMachine, discType);
+	ELSE
+		DO;
+			machine.discXmitCompleted = TRUE;
+			CALL MacDisablePoll(machine.linkNumber);
+		END;
+
+	IF not machine.sendOutstanding THEN
+		CALL FlushSendQueue(sMachine);
+
+END StartDiscFlushing;
+
+
+END PdlActionSupportModule;

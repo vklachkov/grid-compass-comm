@@ -1,0 +1,114 @@
+/**************************************************
+* Module Name : Pdl.inc
+* Function : Common names and types used by the Phone Data Link
+* Edit History : 2/24/83  by mlb: begin coding
+*		3/25/83  by mlb: add synchronous field to TxBufDescType
+*		5/11/83  by mlb: revise error numbers
+**************************************************/
+
+
+/*  Phone data link control Header  */
+DCL PdlcHeader  LIT
+		'frameType		BYTE,		/* frame type		*/
+		flags			BYTE,		/* bit flags		*/
+		windowSize		BYTE,		/* window size	*/
+		seqNumber		BYTE';	/* sequence number */
+DCL PdlcHeaderLength	LIT '4';
+
+/*  Transmission buffer descriptor control  */
+DCL TxBufDescType  LIT 'STRUCTURE
+		(ReadyForTx BOOLEAN, Synchronous BOOLEAN, PdlcHeader, length1 WORD,
+		pPart1 PTR, length2 WORD, pPart2 PTR, writeComplete WORD)';
+
+/*	(ReadyForTx			BOOLEAN,	** TRUE when buffer is ready for Tx //
+		Synchronous		BOOLEAN,	** TRUE when DlcWrite is waiting for
+									completion //
+		PdlcHeader,					** data link transport header		//
+		length1			WORD,		** length of first part			//
+		pPart1			PTR,		** ptr to first part of data		//
+		length2			WORD,		** length of second part			//
+		pPart2			PTR,		** ptr to second part of data		//
+		writeComplete	WORD)';		** semaphore for write complete	//
+*/
+
+/*  States of Pdl machine  */
+DCL SxDisconnected			LIT '0',
+	SxConnecting			LIT '1',
+	SxConnected				LIT '2',
+	SxDisconnecting			LIT '3',
+	SxListening				LIT '4';
+
+/*  Events of Pdl machine  */
+DCL ExRcvdInvalidFrame		LIT '0FFh',
+	ExNull					LIT '0',
+	ExTxReady				LIT '1',
+	ExTimerExpired			LIT '2',
+	ExRcvError				LIT '3',
+	ExRcvdRfc				LIT '4',
+	ExRcvdDisc				LIT '5',
+	ExRcvdAck				LIT '6',
+	ExRcvdPing				LIT '7',
+	ExRcvdData				LIT '8',
+	ExLostCarrier			LIT '9',
+	ExLastEvent				LIT '9';
+
+/*  Interrup service emulator process parms  */
+DCL IsNormalPriority		LIT '90',
+	ISHighPriority			LIT '5',
+	IsStackSize				LIT '1500';
+
+/*  Data link timeout values  */
+DCL DlcWriteTimeOut			LIT '60000';	/* 60000 ms = 60 seconds */
+
+
+DCL SignalNormal			LIT '1',
+	SignalEvent				LIT '2';
+
+DCL	PdlStartTimeOut			AS	'30000';	/* 45000 ms = 45 seconds */
+DCL PdlStopTimeout			AS	'15000';	/* 15000 ms = 15 sec */
+/*  frame type codes  */
+
+DCL RfcType		LIT '1',
+	AckType		LIT '2',
+	DiscType	LIT '3',
+	PingType	LIT '4',
+	DataType	LIT '5';
+
+DCL cr			LIT '0dh',
+	lf			LIT '0ah';
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	Constants for Receive Buffers:
+&	One Max size and one short buffer are used.  The large buffer is used for
+&	receiving both data and other control frames.  When the large buffer is 
+&	filled with data the small buffer is used to receive control information.
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+	/* max Vfs Data (504) + Vfs Header (10) + Vipc Header (12) = 526 */
+
+DCL RxMaxDlcDataSize	LIT '526';  
+
+DCL RxLongBufferDescType  LIT 'STRUCTURE
+		(RxLength		WORD,		/* actual length of frame received  */
+		PdlcHeader,					/* data link transport header		*/
+		DlcDataArea (RxMaxDlcDataSize) BYTE)';/* user data portion of frame		*/
+
+DCL RxShortBufferDescType LIT 'STRUCTURE
+		(RxLength		WORD,
+		PdlcHeader, 
+		pdlConn	 		BYTE,
+	 	pdlVersion  	WORD)';
+
+DCL RxFiFoSize			LIT '1000';
+
+	/* Although the data received in the longest frame can only be 504+10+10
+	bytes long, the physical size of the frame can be larger because of DLE
+	stuffing.  In the worst case, the physical size of the frame will be twice
+	the size of data.  Even in that case, the receive process (IsMain) starts
+	reading as soon as it detects even a single byte in Modem's FIFO, and hence 
+	a smaller fifo should suffice.  In the absoulte worst case the receive 
+	process will not get the CPU to do the receive and the FIFO will overflow,
+	however if it does that for all the 16 retries, something is drastically 
+	wrong. A Fifo of the above size should be more than sufficient. */
+

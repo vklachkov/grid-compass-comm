@@ -1,0 +1,628 @@
+$TITLE ('Compass Central Phone Data Link: Main Module')
+$COMPACT (EXPORTS CcPdlProcess)
+$OPTIMIZE(3)
+$SET (MainModule)
+$SET (PhoneLink)
+ 
+PdlMainModule: DO;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*
+*				COMPASS CENTRAL Phone DATA LINK CONTROL
+*
+*		Module:		PdlMain.
+*
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+$SAVE NOLIST
+
+$INCLUDE (``Incs`Plm.Inc~text~)
+
+$INCLUDE (``CcIncs`DataCommDefines.inc~text~)
+$INCLUDE (``CcIncs`DlcMsgDefines.inc~text~)
+$INCLUDE (``CcIncs`MachineDefines.Inc~text~)
+
+$INCLUDE (PdlConstants.Inc~text~)
+$INCLUDE (PdlMachineDefines.Inc~text~)
+$INCLUDE (NewErrors.Inc~text~)
+$INCLUDE (Gs.Pdl.Ext.Inc~Text~)
+
+$INCLUDE (SelectedDlcActions.inc~text~)
+$INCLUDE (SelectedGeneral.inc~text~)
+
+$INCLUDE (``ccIncs`MacModule.inc~text~)
+$INCLUDE (``ccIncs`UtlModule.inc~text~)
+$INCLUDE (``ccIncs`TimerModule.inc~text~)
+$INCLUDE (``Incs`OsPlmProcs.inc~text~)
+$INCLUDE (``Incs`ConPlmProcs.inc~text~)
+$INCLUDE (``Incs`MovRtns.Plm.inc~text~)
+$RESTORE
+
+$INCLUDE (GlobalVariables~Text~)
+DCL eModLossCarrier		LIT '402';	/* 192h */
+
+$IF Debug
+CrLf: PROCEDURE;
+	CALL ConLineOut(@(cr, lf), 2);
+END CrLf;
+$ENDIF
+
+$EJ
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*					PhoneDatalinkProcess
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+/*
+	new Comments:
+
+	Purpose: This procedure is used to create the primary data link 
+	control process. This process handles state machines for all
+	the MaxPhoneLines number of lines.
+*/
+
+CcPdlProcess: PROCEDURE CLEAN;
+
+DCL	msgType		WORD,
+	x			WORD,
+	shutDown 	BOOLEAN,
+	event 		BYTE,
+	sTempDlCB	SELECTOR,
+	sDlCB		SELECTOR,
+	dlCB		BASED sDlcB STRUCTURE (DlCBgenDescriptor),
+	error		WORD,
+	note		WORD,
+	linkNumber	WORD;
+
+DCL	sCurStateMachine	SELECTOR,
+	curStateMachine		BASED sCurstateMachine	PdlStateMachineType;
+
+	/* Initialize all the state machines */
+
+	DO x = 0 TO (MaxPhoneLines - 1);
+		scurStateMachine,
+		stateMachines (x) = SELECTOR$OF(osAllocate(SIZE(curStateMachine),
+																@error));
+		IF error <> eOK THEN
+		DO;
+			CALL OsLogError(2, error, x, @(11, 'Pdl main 01'));
+			CALL OsExit(0);
+		END;
+		curStateMachine.operating = FALSE;
+		curStateMachine.configured = FALSE;
+	END;
+
+$IF Debug
+	DO;
+		DCL msg CharStr ('Phone Link process created',cr,lf);
+		CALL ConLineOut (@msg, size(msg));
+	END;
+$ENDIF
+
+	shutDown = FALSE;
+
+	/* Now enter the main loop - wait for a message */
+
+	DO WHILE NOT shutDown;
+
+		event = 0;
+rcvMsg:
+		sDlCB = SELECTOR$OF(OsReceive(anyProcess, anyClass, waitForever, @note,
+																@error));
+		IF error <> eOK THEN
+		DO;
+			CALL OsLogError(2, error, 0, @(11, 'Pdl main 02'));
+			goto rcvMsg;
+		END;
+
+		msgType = dlCB.msgformat AND msgDlcFormatMask;
+		linkNumber = dlCB.linkNumber;
+
+		IF linkNumber >= maxPhoneLines THEN
+		DO;
+			event = 0;
+			CALL OsLogError(2, error, linkNumber, @(11, 'Pdl main 03'));
+			CALL GenReturnUserRequest(NULLWORD, sDlCB, eDlcInvalidLinkNumber);
+		END;
+		ELSE
+			DO;
+				sCurStateMachine = stateMachines(linkNumber);
+
+				IF (dlCB.msgFormat = (msgRequest OR dlcConfigure)) THEN
+				DO;
+					DCL configureDlCB	BASED sDlCB STRUCTURE (
+											DlCBgenDescriptor,
+											DlCBPdlConfParams);
+					IF curStateMachine.configured THEN
+						error = eDlcAlreadyConfigured;
+					ELSE
+						DO;
+							curStateMachine.configured = TRUE;
+							curStateMachine.protocolType =
+												configureDlCB.protocolType;
+						END;
+
+$IF Debug
+					DO;
+						DCL msg CharStr ('CONFIGURE link#/err:');
+						CALL ConLineOut (@msg, size(msg));
+						CALL ConHexOut (linkNumber);
+						CALL ConCharOut('/');
+						CALL ConHexOut (error);
+						CALL CrLf;
+					END;
+$ENDIF
+					IF error <> eOk THEN
+						CALL OsLogError(2, error, linkNumber,
+														@(11, 'Pdl main 04'));
+					CALL GenReturnUserRequest (NULLWORD, sDlCB, error);
+				END;
+
+				ELSE
+					IF (msgType AND msgClassMask) = classDlc THEN
+					DO;
+						IF msgType = dlcDie THEN shutDown = TRUE;
+						ELSE
+							event = PdlParseDlcEvent(scurStateMachine, sDlCB);
+					END;
+
+				ELSE
+					IF (msgType AND msgClassMask) = classMac THEN
+					DO;
+						IF ((msgType = macFrameReceive OR msgResponse) 
+								OR (msgType = macFrameIn OR msgResponse)) THEN
+							event = PdlParseReceiveEvent(linkNumber, sDlCB);
+						ELSE
+							event = PdlParseTransmitEvent(linkNumber, sDlCB);
+					END;
+
+				ELSE
+					IF (msgType AND msgClassMask) = classTimer THEN
+						event = PdlParseTimerEvent(linkNumber, sDlCB);
+
+				ELSE 
+					DO;
+$IF debug
+						DO;
+							CALL ConLineOut(@('Bad class - Message src: '), 25);
+							CALL ConHexOut(dlCB.sourcePid);
+							CALL ConLineOut(@(', subclass: '), 12);
+							CALL ConHexOut(msgType);
+							CALL CrLf;
+						END;
+$ENDIF
+						CALL OsLogError(2, 0ffffh, linkNumber,
+														@(11, 'Pdl main 05'));
+						CALL GenReturnUserRequest (NULLWORD, sDlCB,
+														eDlcInvalidRequest);
+					END;
+			END;
+
+		curStateMachine.event = event;
+		IF event <> 0 THEN
+			CALL PdlExecuteMachine(linkNumber, sDlCB);
+
+	END; /* of while */
+
+
+	/*	dlc has received shutdown request message. Need to shutdown each
+		operating machine. No attempt is made by machines to cleanly
+		break any data link connections. */
+
+$IF Debug
+	DO;
+		DCL msg CharStr ('DLC: entering shutdown phase',cr,lf);
+		CALL ConLineOut(@msg, SIZE(msg));
+	END;
+$ENDIF
+
+	DO x = 0 TO (MaxPhoneLines - 1);
+		scurStateMachine = stateMachines (x);
+		IF curStateMachine.operating THEN
+		DO;
+			DO WHILE (sTempDlCB := UtlPopQ(@curStateMachine.sendQhead)) <>
+																nullword;
+				CALL GenReturnUserRequest(scurStateMachine, sTempDlCB,
+															eDlcAborted);
+			END;
+
+			DO WHILE (sTempDlCB := UtlPopQ(@curStateMachine.receiveQhead)) 
+																<> nullword;
+				CALL GenReturnUserRequest(scurStateMachine, sTempDlCB,
+															eDlcAborted);
+			END;
+		END;
+	END;
+
+$IF Debug
+	DO;
+		DCL msg CharStr ('DLC: finished shutdown phase',cr,lf);
+		CALL ConLineOut(@msg, SIZE(msg));
+	END;
+$ENDIF
+
+	CALL MacDisableTransmitter(linkNumber);
+	CALL MacDisableReceiver(linkNumber);
+	CALL MacDisablePoll(linkNumber);
+	CALL GenReturnUserRequest (NULLWORD, sDlCB, 0);
+
+	DO WHILE TRUE; /* a forked process should never return */
+		CALL OsDelay (0ffffh);
+	END;
+
+END CcPdlProcess;
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	PdlParseDlcEvent
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlParseDlcEvent: PROCEDURE (sCurMachine, sDlcB) WORD;
+	
+DCL	sCurMachine	SELECTOR,
+	curMachine	BASED sCurMachine PdlStateMachineType;
+
+DCL	sDlCB		SELECTOR,
+	dlCB		BASED	sDlcB STRUCTURE (DlCBgenDescriptor);
+
+DCL event		WORD,
+	error		WORD,
+	dlcRequest  WORD;
+
+	event = 0;
+	error = 0;
+
+	dlcRequest = dlCB.msgFormat;
+	IF dlCRequest = dlcAttach THEN
+	DO;
+		DCL attDlCB	BASED sDlCB STRUCTURE (DlCBgenDescriptor, DlCBattParams);
+$IF Debug
+		CALL ConLineOut(@('Received attach CB', cr, lf), 20);
+$ENDIF
+
+		IF curMachine.configured THEN 
+		DO;
+			IF curMachine.operating THEN error = eDlcTooManyStations;
+			ELSE
+				DO;
+					CALL MOVB(@pdlMachineInitValues, BUILD$PTR(scurMachine, 0),
+														SIZE(curMachine));
+					curMachine.state = PdlSxClosed;
+					curMachine.linkNumber = dlCB.linkNumber;
+					curMachine.operating = TRUE;
+					curMachine.configured = TRUE;
+					curMachine.responseTime = sendTimeOutMax;
+					curMachine.pollTime = activityTimeOutMax;
+
+					curMachine.userPid = attDlcB.userPid;
+					attDlcB.stationNumber = 0;
+				END;
+		END;
+		ELSE
+			error = eDlcLinkNotConfigured;
+
+$IF Debug
+		DO;
+			DCL msg CharStr ('ATTACH link#/err: ');
+			CALL ConLineOUt (@msg, size(msg));
+			CALL ConHexOUt (dlCB.linkNumber);
+			CALL ConCharOut('/');
+			CALL ConHexOut (error);
+			CALL CrLf;
+		END;
+$ENDIF
+		CALL GenReturnUserRequest (nullWord, sDlCB, error);
+	END;
+
+	ELSE
+		IF (dlcRequest = dlcDetach) THEN
+		DO;
+$IF Debug
+			CALL ConLineOut(@('Received detach CB', cr, lf), 20);
+$ENDIF
+			IF (NOT curMachine.operating) OR curMachine.active THEN
+				error = eDlcInvalidRequest;
+			ELSE
+				curMachine.operating = FALSE;
+
+$IF Debug
+			DO;
+				DCL msg CharStr ('DETACH link#/err: ');
+				CALL ConLineOut (@msg, size(msg));
+				CALL ConHexOut(dlCB.linkNumber);
+				CALL ConCharOut('/');
+				CALL ConHexOut(error);
+				CALL CrLf;
+			END;
+$ENDIF
+
+			IF error <> eOk THEN
+				CALL OsLogError(2, error, dlCB.linkNumber,
+														@(11, 'Pdl main 06'));
+			CALL GenReturnUserRequest(scurMachine, sDlCB, error);
+		END;
+
+	ELSE
+		IF dlcRequest = dlcReceive THEN
+		DO;
+$IF Debug
+			CALL ConLineOut(@('Rcv request on link: '), 21);
+			CALL ConHexOut(dlCB.linkNumber);
+			CALL CrLf;
+$ENDIF
+			dlCB.stationNumber = 0;
+			CALL QueueReceive(sDlCB);
+		END;
+
+	ELSE
+		IF (dlcRequest AND msgDlcCaseMask) > maximumMessageFormat THEN
+		DO;
+			CALL OsLogError(2, eDlcInvalidRequest, dlCB.linkNumber,
+													@(11, 'Pdl Main 07'));
+$IF Debug
+			DO;
+				DCL msg CharStr ('Pdl parse: Invalid Dlc Request: ');
+				CALL ConLineOut (@msg, size(msg));
+				CALL CrLf;
+				CALL ConLineOut(@('Source pid/Message Type: '), 25);
+				CALL ConHexOut(dlCb.sourcePid);
+				CALL ConCharOut('/');
+				CALL ConHexOut(dlCb.msgFormat);
+				CALL CrLf;
+			END;
+$ENDIF
+ 			CALL GenReturnUserRequest (scurMachine, sDlcB, eDlcInvalidRequest);
+		END;
+
+	ELSE
+		DO;
+			DO CASE (dlcRequest AND msgDlcCaseMask);
+			/* 0 = configure	*/  ; /* handled outside */
+			/* 1 = shutdown		*/	DO;/* shutdown = TRUE; */ END;
+			/* 2 = attach		*/	; /* handled outside */
+			/* 3 = detach		*/	; /* handled outside */
+			/* 4 = connect		*/	event = PdlExDlcConnRequest;
+			/* 5 = disconnect	*/  event = PdlExDlcDiscRequest;
+			/* 6 = send			*/	event = PdlExDlcSendRequest;
+			/* 7 = receive		*/	; /* handled outside */
+			/* 8 = abort		*/	DO;  /* This should not happen */
+										CALL GenReturnUserRequest
+													(scurMachine, sDlcB, 0);
+									END;
+			/* 9 = status		*/	event = PdlExDlcStatusRequest;
+			/* 10 = control		*/	event = PdlExDlcControlRequest;
+			/* 11 = flush		*/	event = PdlExDlcFlushRequest;
+			/* 14 = initialize	*/  ;	/* shouldn't receive this event at dlc 
+										handled by interface code and InitDlc */
+			/* 15 = undefined	*/	;	/* Undefined */
+			END; /* of case */
+$IF Debug
+			CALL ConLineOut(@('Request is: '), 12);
+			CALL ConHexOut(dlcRequest AND msgDlcCaseMask);
+			CALL CrLf;
+$ENDIF
+		END;
+
+	RETURN event;
+
+END PdlParseDlcEvent;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	PdlParseReceiveEvent
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlParseReceiveEvent: PROCEDURE (linkNumber, sDlcB) WORD;
+	
+DCL linkNumber	WORD;
+
+DCL sDlCB		SELECTOR,
+	dataDlCB	BASED sDlcB STRUCTURE (DlCBgenDescriptor, DlCBioDataParams);
+
+DCL pBuffer 	POINTER,
+	buffer 		BASED pBuffer STRUCTURE (PdlcHeader);
+
+DCL	scurMachine	SELECTOR,
+	curMachine	BASED	scurMachine	pdlstatemachinetype;
+
+DCL error		WORD,
+	event		BYTE;
+
+	error = 0;
+	event = 0;
+
+	scurMachine = stateMachines (linknumber);
+
+	IF ((dataDlCB.msgFormat AND msgDlcFormatMask) <> macFrameReceive)
+		AND ((dataDlCB.msgFormat AND msgDlcFormatMask) <> macFrameIn) THEN 
+	DO;
+		CALL OsLogError(2, dataDlCB.msgFormat, linkNumber,
+														@(11, 'Pdl Main 08'));
+		CALL AcFreeCB (scurMachine, sDlCB);
+		RETURN (0);
+	END;
+			
+	IF NOT curMachine.operating THEN
+	DO;
+		/* received message on link that is not operating */			
+
+		CALL AcFreeCB (scurMachine, sDlcB);
+		RETURN (0);
+	END;
+
+	IF (dataDlCB.reqError >= recErrorLowRange) AND 
+							(dataDlCB.reqError <= recErrorHighRange) THEN
+	DO;
+		IF (dataDlCB.reqError = recMacDcdOn) AND ((curMachine.state =
+				PdlSxConnecting) OR (curMachine.state = PdlSxListening)) THEN
+			RETURN (PdlExRcvdDcdOn);
+		ELSE
+			RETURN(PdlExRcvRecError);
+	END;
+
+	IF (dataDlCB.reqError <> 0) THEN 
+	DO;
+		IF dataDlCB.reqError = eModLossCarrier THEN
+		DO;
+			IF (curMachine.state = PdlSxConnected) OR
+							(curMachine.state = PdlSxConnecting) OR
+									(curMachine.state = PdlSxListening) THEN
+				RETURN (PdlExRcvIrError);
+			ELSE
+				RETURN(PdlExRcvRecError);
+		END;
+		ELSE
+			IF (curMachine.state <> PdlSxDisconnecting)
+									AND (curMachine.state <> PdlSxClosed) THEN
+			DO;
+				CALL OsLogError(2, dataDlCB.reqError, linkNumber,
+														@(11, 'Pdl Main 09'));
+				RETURN (PdlExRcvIrError);
+			END;
+		ELSE
+			RETURN(PdlExRcvRecError);
+	END;
+
+	IF ((dataDlCB.dataLength AND bufferTypeMask) = msgWithbufferPtr) THEN
+		pBuffer = dataDlCB.pBuffer;
+	ELSE
+		pBuffer = @dataDlCB.pBuffer;
+
+	IF (buffer.frameType > DataType) OR (buffer.frameType = 0) THEN
+	DO;
+		CALL OsLogError(2, buffer.frameType, linkNumber, @(12, 'Pdl InvFrame'));
+		CALL AcFreeCB(scurMachine, sDlcB);
+		event = 0;
+	END;
+	ELSE
+		DO;
+			DO CASE buffer.frameType;
+			/* 0			*/		event = PdlExRcvdInvalidFrame;
+			/* 1: Rfc 		*/		event = PdlExRcvdRfc;
+			/* 2: Ack 		*/		event = PdlExRcvdAck;
+			/* 3: Disc 		*/		event = PdlExRcvdDisc;
+			/* 4: Ping 		*/		event = PdlExRcvdPing;
+			/* 5: Data 		*/		event = PdlExRcvdData;
+			END;
+$IF Debug
+ 			CALL ConLineOut(@('Rcv frame type: '), 16);
+			CALL ConHexOut(buffer.frameType);
+			CALL CrLf;
+$ENDIF
+		END;
+	
+	/* The timer is started only after the first receive event.
+		pollTimerCB is initialised to null */
+
+	IF curmachine.pollTimerOn AND (curMachine.state = PdlSxConnected) THEN 
+	DO;
+		CALL TmrAbortTimeOut (scurmachine, tmrPollTimer);
+		CALL TmrStartPollTimeOut (scurmachine);
+		activityTimerCount = 0;
+$IF Debug
+		DO;
+			DCL msg CharStr ('Poll Timer Aborted & Started', cr, lf);
+ 			CALL ConLineOut (@msg, size (msg));
+		END;
+$ENDIF
+	END;
+
+	RETURN (event);
+END PdlParseReceiveEvent;
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	PdlParseTransmitEvent
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlParseTransmitEvent: PROCEDURE (linkNumber, sDlcB) WORD;
+	
+DCL linkNumber	WORD;
+
+DCL sDlCB		SELECTOR,
+	dlCB		BASED	sDlcB STRUCTURE (DlCBgenDescriptor);
+
+DCL	scurMachine	SELECTOR,
+	curMachine	BASED	scurMachine	pdlstatemachinetype;
+
+	scurMachine = stateMachines (linknumber);
+
+	/* An error check on xmitComplete is not done here, it will be done after
+	    ChkXmitComplete action routines. */
+
+	IF curmachine.operating THEN
+		RETURN (PdlExXmitComplete);
+	ELSE 
+		DO;
+			CALL OsLogError(2, 0ffffh, linkNumber, @(11, 'Pdl Main 10'));
+			CALL AcFreeCB(scurMachine, sDlcB);
+ 			RETURN (0);
+		END;
+
+END PdlParseTransmitEvent;
+
+
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+*	PdlParseTimerEvent
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+PdlParseTimerEvent: PROCEDURE (linkNumber, sDlcB) WORD;
+	
+DCL linkNumber	WORD;
+
+DCL sDlCB		SELECTOR,
+	dlCB		BASED sDlcB STRUCTURE (DlCBgenDescriptor);
+
+DCL	scurMachine	SELECTOR,
+	curMachine	BASED scurMachine pdlstatemachinetype;
+
+DCL event		BYTE;
+
+DCL msgType		WORD;
+
+	event = 0;
+
+	scurmachine = statemachines (linknumber);
+
+	IF dlCB.linkNumber < MaxPhoneLines THEN
+	DO;
+		msgType = dlCB.msgFormat AND msgTmrFormatMask;
+
+		IF msgType = tmrResponseTimer THEN 
+		DO; 
+			curmachine.responseTimerCB = nullWord;
+			event = PdlExResponseTimeOut;
+$IF Debug
+			CALL ConLineOut(@('Response timeout', cr, lf), 18);
+$ENDIF
+		END;
+
+		ELSE
+			IF msgType = tmrPollTimer THEN 
+			DO; 
+				curmachine.pollTimerCB = nullWord;
+				curmachine.pollTimerOn = FALSE;
+				event = PdlExPollTimeOut;
+$IF Debug
+				CALL ConLineOut(@('Poll timeout', cr, lf), 14);
+$ENDIF
+			END;
+
+		ELSE
+			IF msgType = tmrUserTimer THEN 
+			DO; 
+				curmachine.userTimerCB = nullWord;
+				event = PdlExUserTimeOut;
+$IF Debug
+				CALL ConLineOut(@('User timeout', cr, lf), 14);
+$ENDIF
+			END;
+
+		sDlCB = UtlFreeCB (sDlCB);
+		RETURN event;
+	END;
+
+END PdlParseTimerEvent;
+
+
+END PdlMainModule; 

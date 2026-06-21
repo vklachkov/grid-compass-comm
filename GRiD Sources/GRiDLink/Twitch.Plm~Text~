@@ -1,0 +1,158 @@
+$TITLE ('CCDL Action Routines')
+$COMPACT
+$PAGEWIDTH(96) OPTIMIZE(3) SET(twitch)
+
+Twitch: DO;
+
+$INCLUDE (``Incs`Plm.Inc~Text~)
+
+/* EXTERNALs */
+
+WinInvertRectangle: PROCEDURE (pRect) EXTERNAL;
+	DECLARE pRect POINTER;
+	END;
+
+WinGetWindowExtent: PROCEDURE (pExtent) EXTERNAL;
+	DECLARE pExtent POINTER;
+	END;
+
+OsDelay:PROCEDURE (delayTime) EXTERNAL;
+	DCL delayTime 	WORD;
+	END;
+
+$IF MsDos AND PC
+PcDisplayMode: PROCEDURE BYTE EXTERNAL;
+  END;
+
+PcPrepareCursorForTwitch: PROCEDURE EXTERNAL;
+  END;
+
+PcRestoreCursorFromTwitch: PROCEDURE EXTERNAL;
+  END;
+
+PcTurnOnTopTwitch: PROCEDURE EXTERNAL;
+  END;
+
+PcTurnOnBottomTwitch: PROCEDURE EXTERNAL;
+  END;
+
+$ENDIF
+
+$IF notused
+$IF debugging
+DCL DebugMask WORD EXTERNAL;
+$INCLUDE (Debug.Inc~Text~)
+$ENDIF
+$ENDIF
+
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	TWITCH VARIABLES
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DECLARE	Rectangle LITERALLY
+		'STRUCTURE ((topLeftX, topLeftY, extentX, extentY) WORD)';
+
+DECLARE WindowExtent STRUCTURE ((X, Y) WORD);
+
+DECLARE oddTwitch BOOLEAN INITIAL (true);
+
+$IF Debugging
+DECLARE rect STRUCTURE
+				((topLeftX, topLeftY, extentX, extentY) WORD)
+			INITIAL (2, 0, 2, 2);
+$ENDIF
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	TURNTWITCHON
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+TurnTwitchOn: PROCEDURE DWORD CLEAN;
+DCL TwitchStateDword	DWORD;
+DCL TwitchState STRUCTURE (
+			topLeftX	WORD, 
+			topLeftY	WORD) AT (@TwitchStateDword);
+DCL TwitchRect			Rectangle;
+
+$IF MsDos AND PC
+	IF (PcDisplayMode < 4) OR (PcDisplayMode > 6) THEN
+		DO;
+		CALL PcPrepareCursorForTwitch;
+		IF oddTwitch THEN CALL PcTurnOnTopTwitch;
+		ELSE CALL PcTurnOnBottomTwitch;
+		RETURN (twitchStateDword);
+		END;
+$ENDIF
+	CALL WinGetWindowExtent (@WindowExtent);
+
+	twitchState.topLeftY = WindowExtent.Y-6;
+	IF oddTwitch THEN twitchState.topLeftX = 3;
+	ELSE twitchState.topLeftX = 0;
+
+	twitchRect.topLeftX = twitchState.topLeftX;
+	twitchRect.topLeftY = twitchState.topLeftY;
+	twitchRect.extentX,
+	twitchRect.extentY = 3;
+	CALL WinInvertRectangle (@twitchRect);
+
+	twitchRect.topLeftX = 3 - twitchRect.topLeftX;
+	twitchRect.topLeftY = 3 + twitchRect.topLeftY;
+	CALL WinInvertRectangle (@twitchRect);
+	RETURN (twitchStateDword);
+END TurnTwitchOn;
+
+
+$EJECT
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	TURNTWITCHOFF
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+TurnTwitchOff: PROCEDURE (twitchStateDword) CLEAN;
+DCL TwitchStateDword	DWORD;
+DCL TwitchState STRUCTURE (
+			topLeftX	WORD, 
+			topLeftY	WORD) AT (@TwitchStateDword);
+DCL TwitchRect			Rectangle;
+
+$IF MsDos AND PC
+	IF (PcDisplayMode < 4) OR (PcDisplayMode > 6) THEN
+		DO;
+		CALL PcRestoreCursorFromTwitch;
+		END;
+	ELSE
+$ENDIF
+		DO;
+		twitchRect.topLeftX = twitchState.topLeftX;
+		twitchRect.topLeftY = twitchState.topLeftY;
+		twitchRect.extentX,
+		twitchRect.extentY = 3;
+		CALL WinInvertRectangle (@twitchRect);
+
+		twitchRect.topLeftX = 3 - twitchRect.topLeftX;
+		twitchRect.topLeftY = 3 + twitchRect.topLeftY;
+		CALL WinInvertRectangle (@twitchRect);
+		END;
+
+	oddTwitch = NOT oddTwitch;
+END TurnTwitchOff;	
+
+
+$IF Debugging
+/*&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
+&	DiagnosticTwitch
+&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&*/
+
+DiagnosticTwitch: PROCEDURE CLEAN;
+$IF MsDos AND PC
+	IF (PcDisplayMode < 4) OR (PcDisplayMode > 6) THEN RETURN;
+$ENDIF
+	CALL WinGetWindowExtent (@WindowExtent);
+	rect.topLeftY = WindowExtent.Y - 4;
+	CALL WinInvertRectangle (@rect);
+	CALL OsDelay (20);
+	CALL WinInvertRectangle (@rect);
+END DiagnosticTwitch;
+$ENDIF
+
+END Twitch;
