@@ -1,13 +1,14 @@
 mod gridlink;
 
 use std::{
+    collections::HashMap,
     io,
     net::{SocketAddr, TcpListener, TcpStream},
     process::ExitCode,
     thread,
 };
 
-use crate::gridlink::{DataFrameBody, EOM_FLAG_ON, Frame, FrameBody, FrameType};
+use crate::gridlink::{DataFrameBody, EOM_FLAG_ON, Frame, FrameBody, FrameType, VipcConnectHeader};
 
 fn main() -> ExitCode {
     match server() {
@@ -50,6 +51,8 @@ fn try_worker(mut client: TcpStream, addr: SocketAddr) -> io::Result<()> {
     let conn_id: u8 = 0x7B;
     let mut seq_number: u8 = 0x1C;
 
+    let mut last_path_id: u16 = 1;
+
     loop {
         let frame = gridlink::Frame::read_from_io(&mut client)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -81,13 +84,29 @@ fn try_worker(mut client: TcpStream, addr: SocketAddr) -> io::Result<()> {
                 };
 
                 match data {
+                    DataFrameBody::Connect { header, path } => {
+                        seq_number = seq_number.wrapping_add(1);
+                        last_path_id = last_path_id.wrapping_add(1);
+                        Frame::data(
+                            seq_number,
+                            EOM_FLAG_ON,
+                            DataFrameBody::ConnectResponse {
+                                header: VipcConnectHeader {
+                                    local_path_id: last_path_id,
+                                    remote_path_id: header.local_path_id,
+                                },
+                                status: 0, // OK
+                            },
+                        )
+                        .write_to_io(&mut client)?;
+                    }
                     DataFrameBody::SignOn { .. } => {
                         seq_number = seq_number.wrapping_add(1);
                         Frame::data(
                             seq_number,
                             EOM_FLAG_ON,
                             DataFrameBody::SignOnResponse {
-                                sign_on_status: 0, // OK
+                                status: 0, // OK
                                 server_name: "vklachkov server",
                             },
                         )

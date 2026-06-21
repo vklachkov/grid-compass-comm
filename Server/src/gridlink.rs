@@ -76,11 +76,19 @@ pub enum VipcProtocolFunctionCode {
 
 #[derive(Clone, Debug)]
 pub enum DataFrameBody {
+    Connect {
+        header: VipcConnectHeader,
+        path: String,
+    },
+    ConnectResponse {
+        header: VipcConnectHeader,
+        status: u16,
+    },
     SignOn {
         properties: Vec<DataProperty>,
     },
     SignOnResponse {
-        sign_on_status: u16,
+        status: u16,
         server_name: &'static str,
     },
 }
@@ -90,6 +98,13 @@ pub struct DataProperty {
     pub ty: u8,
     pub length: u8,
     pub value: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Immutable, Unaligned, KnownLayout, FromBytes, IntoBytes)]
+#[repr(packed)]
+pub struct VipcConnectHeader {
+    pub local_path_id: u16,
+    pub remote_path_id: u16,
 }
 
 #[derive(Debug, Error)]
@@ -266,14 +281,18 @@ impl Frame {
         let code = Self::read_entity::<VipcProtocolFunctionCode>(&mut src)?;
 
         match code {
+            VipcProtocolFunctionCode::Connect => Ok(DataFrameBody::Connect {
+                header: Self::read_entity::<VipcConnectHeader>(&mut src)?,
+                path: Self::read_pascal_string(&mut src)?,
+            }),
             VipcProtocolFunctionCode::SignOn => Ok(DataFrameBody::SignOn {
-                properties: Self::read_properties(&mut src)?,
+                properties: Self::read_signon_properties(&mut src)?,
             }),
             _ => unimplemented!("function {code:?}"),
         }
     }
 
-    fn read_properties(mut src: impl io::Read) -> Result<Vec<DataProperty>, FrameReadError> {
+    fn read_signon_properties(mut src: impl io::Read) -> Result<Vec<DataProperty>, FrameReadError> {
         let mut properties = Vec::<DataProperty>::with_capacity(6);
 
         loop {
@@ -295,6 +314,18 @@ impl Frame {
         }
 
         Ok(properties)
+    }
+
+    fn read_pascal_string(mut src: impl io::Read) -> Result<String, FrameReadError> {
+        let mut length = 0;
+        src.read_exact(slice::from_mut(&mut length))?;
+
+        let mut raw = vec![0; length as usize];
+        src.read_exact(&mut raw)?;
+
+        String::from_utf8(raw).map_err(|err| FrameReadError::Validation {
+            reason: format!("invalid string {:02x?}", err.as_bytes()),
+        })
     }
 
     pub fn write_to_io(self, mut dst: impl io::Write) -> io::Result<()> {
@@ -333,14 +364,21 @@ impl Frame {
             FrameBody::Disc(b) => response.extend(b.as_bytes()),
             FrameBody::Ping(b) => response.extend(b.as_bytes()),
             FrameBody::Data(b) => match b {
+                DataFrameBody::Connect { .. } => unimplemented!(),
+                DataFrameBody::ConnectResponse { header, status } => {
+                    response
+                        .extend((VipcProtocolFunctionCode::ConnectResponse as u16).to_le_bytes());
+                    response.extend(header.as_bytes());
+                    response.extend(status.to_le_bytes());
+                }
                 DataFrameBody::SignOn { .. } => unimplemented!(),
                 DataFrameBody::SignOnResponse {
-                    sign_on_status,
+                    status,
                     server_name,
                 } => {
                     response
                         .extend((VipcProtocolFunctionCode::SignOnResponse as u16).to_le_bytes());
-                    response.extend(sign_on_status.to_le_bytes());
+                    response.extend(status.to_le_bytes());
                     response.push(server_name.len() as u8);
                     response.extend(server_name.as_bytes());
                 }
