@@ -887,18 +887,18 @@ MODEM_INT_HANDLER proc far              ; DATA XREF: COM2_REQ_INIT+7F↓o
                 call    MODEM_READ_STATUS
                 mov     bl, ah
                 mov     di, offset MODEM_STATE_BITS
-                cmp     bl, 0           ; ???
-                jz      short loc_73B
-                test    bl, 80h         ; Modem received byte
-                jz      short RECEIVE_BYTE
+                cmp     bl, 0
+                jz      short LINE_STATE_CHANGED
+                test    bl, 80h
+                jz      short BYTE_FOR_READ_APPEARED
 
-loc_73B:                                ; CODE XREF: MODEM_INT_HANDLER+1D↑j
+LINE_STATE_CHANGED:                     ; CODE XREF: MODEM_INT_HANDLER+1D↑j
                 mov     al, 1
                 call    MODEM_READ_STATUS
                 test    ah, 80h
-                jz      short MODEM_STATUS_1_80h
+                jz      short CHECK_LINE_STATE
                 cmp     SHADOW_MODEM_OPTIONS.UNK_8, 0FFh
-                jz      short MODEM_ONLINE
+                jz      short FORCE_COMMAND_MODE_AND_CHECK_MODEM_STATUS
 
 RESET_PATH:                             ; Reset state
                 and     word ptr [di], not MDM_ONLINE
@@ -925,38 +925,38 @@ WRITE_OPTION_TO_MODEM:                  ; CODE XREF: MODEM_INT_HANDLER+60↑j
                 inc     si
                 loop    WRITE_OPTIONS_TO_MODEM_LOOP
 
-MODEM_ONLINE:                           ; CODE XREF: MODEM_INT_HANDLER+33↑j
+FORCE_COMMAND_MODE_AND_CHECK_MODEM_STATUS: ; CODE XREF: MODEM_INT_HANDLER+33↑j
                 or      STATE_BITS, 8000h
                 mov     al, 1
                 call    MODEM_READ_STATUS
 
-MODEM_STATUS_1_80h:                     ; CODE XREF: MODEM_INT_HANDLER+2C↑j
+CHECK_LINE_STATE:                       ; CODE XREF: MODEM_INT_HANDLER+2C↑j
                 test    ah, 10h
                 jz      short RESET_CARRIER_DETECTED_FLAG
                 or      word ptr [di], MDM_CARRIER_DETECTED
-                jmp     short loc_79E
+                jmp     short CHECK_RING
 ; ---------------------------------------------------------------------------
 
 RESET_CARRIER_DETECTED_FLAG:            ; CODE XREF: MODEM_INT_HANDLER+7B↑j
                 and     word ptr [di], not MDM_CARRIER_DETECTED
 
-loc_79E:                                ; CODE XREF: MODEM_INT_HANDLER+81↑j
+CHECK_RING:                             ; CODE XREF: MODEM_INT_HANDLER+81↑j
                 test    ah, 8
-                jz      short loc_7AB
+                jz      short CHECK_LINE_READINESS
                 or      word ptr [di], MDM_RING_SEEN
                 inc     REG_S1
 
-loc_7AB:                                ; CODE XREF: MODEM_INT_HANDLER+8A↑j
+CHECK_LINE_READINESS:                   ; CODE XREF: MODEM_INT_HANDLER+8A↑j
                 test    ah, 4
-                jz      short loc_7B6
+                jz      short LINE_NOT_READY
                 or      word ptr [di], MDM_LINE_READY
-                jmp     short RECEIVE_BYTE
+                jmp     short BYTE_FOR_READ_APPEARED
 ; ---------------------------------------------------------------------------
 
-loc_7B6:                                ; CODE XREF: MODEM_INT_HANDLER+97↑j
+LINE_NOT_READY:                         ; CODE XREF: MODEM_INT_HANDLER+97↑j
                 and     word ptr [di], not MDM_LINE_READY
 
-RECEIVE_BYTE:                           ; CODE XREF: MODEM_INT_HANDLER+22↑j
+BYTE_FOR_READ_APPEARED:                 ; CODE XREF: MODEM_INT_HANDLER+22↑j
                                         ; MODEM_INT_HANDLER+9D↑j
                 test    word ptr [di], MDM_ONLINE
                 jz      short DONE      ; Notify modem that interrupt handled
