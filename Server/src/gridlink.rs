@@ -2,7 +2,7 @@ use std::{io, slice};
 
 use thiserror::Error;
 use zerocopy::{
-    FromBytes, Immutable, IntoBytes, KnownLayout, LE, TryFromBytes, TryReadError, U16, Unaligned,
+    FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
 };
 
 const DLE: u8 = 0x10;
@@ -91,6 +91,11 @@ pub enum DataFrameBody {
         status: u16,
         server_name: &'static str,
     },
+    SignOff,
+    Msg {
+        header: VipcMessageHeader,
+        body: VipcMessageBody,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +110,136 @@ pub struct DataProperty {
 pub struct VipcConnectHeader {
     pub local_path_id: u16,
     pub remote_path_id: u16,
+}
+
+#[derive(Clone, Copy, Debug, Immutable, Unaligned, KnownLayout, FromBytes, IntoBytes)]
+#[repr(packed)]
+pub struct VipcMessageHeader {
+    pub local_path_id: u16,
+    pub remote_path_id: u16,
+    pub class: u16,
+    pub note: u16,
+    pub data_length: u16,
+}
+
+#[derive(Clone, Debug)]
+pub enum VipcMessageBody {
+    VfsRequest(VfsRequest),
+    VfsResponse(VfsResponse),
+    Raw(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsRequest {
+    pub header: VfsRequestHeader,
+    pub body: VfsRequestBody,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum VfsRequestCode {
+    Open = 2,
+    Read = 4,
+    Write = 5,
+    Seek = 6,
+    Attach = 8,
+    Detach = 9,
+    ReadDesc = 12,
+    WriteDesc = 13,
+    SetStatus = 20,
+    ReadDirPage = 29,
+    Unsupported = 0xFFFF,
+}
+
+impl VfsRequestCode {
+    pub fn from_raw(raw: u16) -> Self {
+        match raw {
+            2 => Self::Open,
+            4 => Self::Read,
+            5 => Self::Write,
+            6 => Self::Seek,
+            8 => Self::Attach,
+            9 => Self::Detach,
+            12 => Self::ReadDesc,
+            13 => Self::WriteDesc,
+            20 => Self::SetStatus,
+            29 => Self::ReadDirPage,
+            _ => Self::Unsupported,
+        }
+    }
+
+    pub fn as_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum VfsRequestBody {
+    Attach(VfsAttachRequest),
+    Open(VfsOpenRequest),
+    Read(VfsReadRequest),
+    Seek(VfsSeekRequest),
+    Write(VfsWriteRequest),
+    Simple,
+    Raw(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsAttachRequest {
+    pub mode: u8,
+    pub access: u8,
+    pub password: [u8; 17],
+    pub path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsOpenRequest {
+    pub num_buf: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsReadRequest {
+    pub data_length: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsSeekRequest {
+    pub mode: u8,
+    pub position: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsWriteRequest {
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Immutable, Unaligned, KnownLayout, FromBytes, IntoBytes)]
+#[repr(packed)]
+pub struct VfsRequestHeader {
+    pub request: u16,
+    pub requestors_conn_id: u16,
+    pub servers_conn_id: u16,
+}
+
+#[derive(Clone, Debug)]
+pub enum VfsResponse {
+    Simple(VfsSimpleResponse),
+    Read(VfsReadResponse),
+}
+
+#[derive(Clone, Copy, Debug, Immutable, Unaligned, KnownLayout, FromBytes, IntoBytes)]
+#[repr(packed)]
+pub struct VfsSimpleResponse {
+    pub response: u16,
+    pub servers_conn_id: u16,
+    pub requestors_conn_id: u16,
+    pub error: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsReadResponse {
+    pub common: VfsSimpleResponse,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -285,11 +420,173 @@ impl Frame {
                 header: Self::read_entity::<VipcConnectHeader>(&mut src)?,
                 path: Self::read_pascal_string(&mut src)?,
             }),
+            VipcProtocolFunctionCode::Msg => {
+                let header = Self::read_entity::<VipcMessageHeader>(&mut src)?;
+                let mut payload = vec![0; header.data_length as usize];
+                src.read_exact(&mut payload)?;
+
+                let body = if header.class == 83 {
+                    let mut payload_reader = io::Cursor::new(payload);
+                    // TODO: make protocol integer decoding explicit before supporting BE machines.
+                    let request_header =
+                        Self::read_entity::<VfsRequestHeader>(&mut payload_reader)?;
+                    let mut request_payload = Vec::new();
+                    io::Read::read_to_end(&mut payload_reader, &mut request_payload)?;
+
+                    VipcMessageBody::VfsRequest(VfsRequest {
+                        header: request_header,
+                        body: Self::read_vfs_request_body(
+                            VfsRequestCode::from_raw(request_header.request),
+                            request_payload,
+                        )?,
+                    })
+                } else {
+                    VipcMessageBody::Raw(payload)
+                };
+
+                Ok(DataFrameBody::Msg { header, body })
+            }
             VipcProtocolFunctionCode::SignOn => Ok(DataFrameBody::SignOn {
                 properties: Self::read_signon_properties(&mut src)?,
             }),
+            VipcProtocolFunctionCode::SignOff => Ok(DataFrameBody::SignOff),
             _ => unimplemented!("function {code:?}"),
         }
+    }
+
+    fn read_vfs_request_body(
+        request: VfsRequestCode,
+        payload: Vec<u8>,
+    ) -> Result<VfsRequestBody, FrameReadError> {
+        match request {
+            VfsRequestCode::Attach => Self::read_vfs_attach_request(payload),
+            VfsRequestCode::Open => Self::read_vfs_open_request(payload),
+            VfsRequestCode::Read | VfsRequestCode::ReadDesc | VfsRequestCode::ReadDirPage => {
+                Self::read_vfs_read_request(payload)
+            }
+            VfsRequestCode::Seek => Self::read_vfs_seek_request(payload),
+
+            VfsRequestCode::Write | VfsRequestCode::WriteDesc | VfsRequestCode::SetStatus => {
+                Self::read_vfs_write_request(payload)
+            }
+            VfsRequestCode::Detach => Self::read_empty_vfs_request(payload),
+            VfsRequestCode::Unsupported => Ok(VfsRequestBody::Raw(payload)),
+        }
+    }
+
+    fn read_vfs_attach_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+        const ATTACH_FIXED_PAYLOAD_SIZE: usize = 19;
+
+        if payload.len() < ATTACH_FIXED_PAYLOAD_SIZE {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS attach payload: expected at least {ATTACH_FIXED_PAYLOAD_SIZE} bytes, found {}",
+                    payload.len()
+                ),
+            });
+        }
+
+        let mode = payload[0];
+        let access = payload[1];
+        let mut password = [0u8; 17];
+        password.copy_from_slice(&payload[2..ATTACH_FIXED_PAYLOAD_SIZE]);
+
+        let mut path_reader = io::Cursor::new(&payload[ATTACH_FIXED_PAYLOAD_SIZE..]);
+        let path = Self::read_pascal_string(&mut path_reader)?;
+
+        Ok(VfsRequestBody::Attach(VfsAttachRequest {
+            mode,
+            access,
+            password,
+            path,
+        }))
+    }
+
+    fn read_vfs_open_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+        let Some((&num_buf, extra)) = payload.split_first() else {
+            return Err(FrameReadError::Validation {
+                reason: "invalid VFS open payload: expected num_buf byte".to_owned(),
+            });
+        };
+
+        if !extra.is_empty() {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS open payload: expected 1 byte, found {}",
+                    payload.len()
+                ),
+            });
+        }
+
+        Ok(VfsRequestBody::Open(VfsOpenRequest { num_buf }))
+    }
+
+    fn read_vfs_read_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+        if payload.len() != 2 {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS read payload: expected 2 bytes, found {}",
+                    payload.len()
+                ),
+            });
+        }
+
+        Ok(VfsRequestBody::Read(VfsReadRequest {
+            data_length: u16::from_le_bytes([payload[0], payload[1]]),
+        }))
+    }
+
+    fn read_vfs_seek_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+        if payload.len() != 5 {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS seek payload: expected 5 bytes, found {}",
+                    payload.len()
+                ),
+            });
+        }
+
+        Ok(VfsRequestBody::Seek(VfsSeekRequest {
+            mode: payload[0],
+            position: u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
+        }))
+    }
+
+    fn read_vfs_write_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+        if payload.len() < 2 {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS write payload: expected at least 2 bytes, found {}",
+                    payload.len()
+                ),
+            });
+        }
+
+        let data_length = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        let data = payload[2..].to_vec();
+        if data.len() != data_length {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS write payload: declared {data_length} bytes, found {}",
+                    data.len()
+                ),
+            });
+        }
+
+        Ok(VfsRequestBody::Write(VfsWriteRequest { data }))
+    }
+
+    fn read_empty_vfs_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+        if !payload.is_empty() {
+            return Err(FrameReadError::Validation {
+                reason: format!(
+                    "invalid VFS simple payload: expected 0 bytes, found {}",
+                    payload.len()
+                ),
+            });
+        }
+
+        Ok(VfsRequestBody::Simple)
     }
 
     fn read_signon_properties(mut src: impl io::Read) -> Result<Vec<DataProperty>, FrameReadError> {
@@ -331,6 +628,8 @@ impl Frame {
     pub fn write_to_io(self, mut dst: impl io::Write) -> io::Result<()> {
         let frame_data = self.serialize();
         let crc = Self::crc16_arc(&frame_data);
+
+        // println!("unstuffed response frame data: {frame_data:02x?}");
 
         let count_of_dle = frame_data.iter().filter(|&&b| b == DLE).count();
         let frame_data = if count_of_dle == 0 {
@@ -382,7 +681,41 @@ impl Frame {
                     response.push(server_name.len() as u8);
                     response.extend(server_name.as_bytes());
                 }
+                DataFrameBody::SignOff => {
+                    response.extend((VipcProtocolFunctionCode::SignOff as u16).to_le_bytes());
+                }
+                DataFrameBody::Msg { header, body } => {
+                    response.extend((VipcProtocolFunctionCode::Msg as u16).to_le_bytes());
+
+                    let body = Self::serialize_vipc_message_body(body);
+                    let header = VipcMessageHeader {
+                        data_length: body.len() as u16,
+                        ..header
+                    };
+
+                    response.extend(header.as_bytes());
+                    response.extend(body);
+                }
             },
+        }
+
+        response
+    }
+
+    fn serialize_vipc_message_body(body: VipcMessageBody) -> Vec<u8> {
+        let mut response = Vec::with_capacity(64);
+
+        match body {
+            VipcMessageBody::VfsRequest(_) => unimplemented!(),
+            VipcMessageBody::VfsResponse(vfs_response) => match vfs_response {
+                VfsResponse::Simple(simple) => response.extend(simple.as_bytes()),
+                VfsResponse::Read(read) => {
+                    response.extend(read.common.as_bytes());
+                    response.extend((read.data.len() as u16).to_le_bytes());
+                    response.extend(read.data);
+                }
+            },
+            VipcMessageBody::Raw(raw) => response.extend(raw),
         }
 
         response
