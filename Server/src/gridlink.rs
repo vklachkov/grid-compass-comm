@@ -145,7 +145,9 @@ pub struct VfsRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
 pub enum VfsRequestCode {
+    GetStatus = 1,
     Open = 2,
+    Close = 3,
     Read = 4,
     Write = 5,
     Seek = 6,
@@ -161,7 +163,9 @@ pub enum VfsRequestCode {
 impl VfsRequestCode {
     pub fn from_raw(raw: u16) -> Self {
         match raw {
+            1 => Self::GetStatus,
             2 => Self::Open,
+            3 => Self::Close,
             4 => Self::Read,
             5 => Self::Write,
             6 => Self::Seek,
@@ -246,6 +250,7 @@ pub struct VfsSimpleResponse {
 #[derive(Clone, Debug)]
 pub struct VfsReadResponse {
     pub common: VfsSimpleResponse,
+    pub data_length: u16,
     pub data: Vec<u8>,
 }
 
@@ -475,15 +480,16 @@ impl Frame {
         match request {
             VfsRequestCode::Attach => Self::read_vfs_attach_request(payload),
             VfsRequestCode::Open => Self::read_vfs_open_request(payload),
-            VfsRequestCode::Read | VfsRequestCode::ReadDesc | VfsRequestCode::ReadDirPage => {
-                Self::read_vfs_read_request(payload)
-            }
+            VfsRequestCode::GetStatus
+            | VfsRequestCode::Read
+            | VfsRequestCode::ReadDesc
+            | VfsRequestCode::ReadDirPage => Self::read_vfs_read_request(payload),
             VfsRequestCode::Seek => Self::read_vfs_seek_request(payload),
 
             VfsRequestCode::Write | VfsRequestCode::WriteDesc | VfsRequestCode::SetStatus => {
                 Self::read_vfs_write_request(payload)
             }
-            VfsRequestCode::Detach => Self::read_empty_vfs_request(payload),
+            VfsRequestCode::Close | VfsRequestCode::Detach => Self::read_empty_vfs_request(payload),
             VfsRequestCode::Unsupported => Ok(VfsRequestBody::Raw(payload)),
         }
     }
@@ -732,7 +738,7 @@ impl Frame {
                 VfsResponse::Simple(simple) => response.extend(simple.as_bytes()),
                 VfsResponse::Read(read) => {
                     response.extend(read.common.as_bytes());
-                    response.extend((read.data.len() as u16).to_le_bytes());
+                    response.extend(read.data_length.to_le_bytes());
                     response.extend(read.data);
                 }
             },
