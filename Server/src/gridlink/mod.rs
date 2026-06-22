@@ -1,13 +1,14 @@
+mod error;
+mod raw_frame;
+
 use std::{io, slice};
 
-use thiserror::Error;
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes, TryReadError, Unaligned,
 };
 
-const DLE: u8 = 0x10;
-const STX: u8 = 0x02;
-const ETX: u8 = 0x03;
+pub use self::error::FrameError;
+use self::raw_frame::RawFrame;
 
 pub const EOM_FLAG_ON: u8 = 1;
 
@@ -254,21 +255,6 @@ pub struct VfsReadResponse {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Error)]
-pub enum FrameReadError {
-    #[error("malformed frame marker {marker:#04x}")]
-    MalformedFrameMarker { marker: u8 },
-
-    #[error("invalid frame CRC: expected {expected:#06x}, found {found:#06x}")]
-    InvalidCrc { expected: u16, found: u16 },
-
-    #[error("validation error: {reason}")]
-    Validation { reason: String },
-
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
 impl Frame {
     pub fn rfc(conn_id: u8, seq_number: u8, flags: u8) -> Self {
         Frame {
@@ -319,59 +305,12 @@ impl Frame {
         &self.body
     }
 
-    pub fn read_from_io(mut src: impl io::Read) -> Result<Self, FrameReadError> {
-        let raw = Self::read_raw_frame(&mut src)?;
-        Self::deserialize(raw)
+    pub fn read_from_io(src: impl io::Read) -> Result<Self, FrameError> {
+        let raw = RawFrame::read_from_io(src)?;
+        Self::deserialize(raw.data)
     }
 
-    pub fn read_raw_frame(mut src: impl io::Read) -> Result<Vec<u8>, FrameReadError> {
-        // Skip all bytes until start sequence.
-        let mut pair = [0u8; 2];
-        while pair != [DLE, STX] {
-            pair[0] = pair[1];
-            src.read_exact(&mut pair[1..=1])?;
-        }
-
-        // Read all bytes and unstuff them until end sequence.
-        let mut buffer = Vec::with_capacity(64);
-        loop {
-            let mut byte = 0u8;
-            src.read_exact(slice::from_mut(&mut byte))?;
-
-            if byte != DLE {
-                buffer.push(byte);
-                continue;
-            }
-
-            src.read_exact(slice::from_mut(&mut byte))?;
-            match byte {
-                DLE => buffer.push(DLE),
-                STX => buffer.clear(),
-                ETX => break,
-                marker => {
-                    return Err(FrameReadError::MalformedFrameMarker { marker });
-                }
-            }
-        }
-
-        let expected_crc = Self::crc16_arc(&buffer);
-
-        // Check frame checksum after.
-        let mut crc = [0u8; 2];
-        src.read_exact(&mut crc)?;
-
-        let crc = u16::from_le_bytes(crc);
-        if crc != expected_crc {
-            return Err(FrameReadError::InvalidCrc {
-                expected: expected_crc,
-                found: crc,
-            });
-        }
-
-        Ok(buffer)
-    }
-
-    pub fn deserialize(buffer: Vec<u8>) -> Result<Self, FrameReadError> {
+    pub fn deserialize(buffer: Vec<u8>) -> Result<Self, FrameError> {
         let mut r = io::Cursor::new(buffer);
 
         let header = Self::read_entity::<FrameHeader>(&mut r)?;
@@ -389,25 +328,7 @@ impl Frame {
         Ok(Frame { header, body })
     }
 
-    fn crc16_arc(data: &[u8]) -> u16 {
-        let mut crc = 0;
-
-        for byte in data {
-            crc ^= *byte as u16;
-
-            for _ in 0..8 {
-                if (crc & 0x0001) != 0 {
-                    crc = (crc >> 1) ^ 0xA001;
-                } else {
-                    crc >>= 1;
-                }
-            }
-        }
-
-        crc
-    }
-
-    fn read_entity<S>(mut src: impl io::Read) -> Result<S, FrameReadError>
+    fn read_entity<S>(mut src: impl io::Read) -> Result<S, FrameError>
     where
         S: KnownLayout + TryFromBytes,
     {
@@ -417,13 +338,13 @@ impl Frame {
         match S::try_read_from_bytes(&data) {
             Ok(s) => Ok(s),
             Err(TryReadError::Size(_)) => unreachable!(),
-            Err(TryReadError::Validity(err)) => Err(FrameReadError::Validation {
+            Err(TryReadError::Validity(err)) => Err(FrameError::Validation {
                 reason: err.to_string(),
             }),
         }
     }
 
-    fn read_data(mut src: impl io::Read) -> Result<DataFrameBody, FrameReadError> {
+    fn read_data(mut src: impl io::Read) -> Result<DataFrameBody, FrameError> {
         // FIXME: support BE machines.
         let code = Self::read_entity::<VipcProtocolFunctionCode>(&mut src)?;
 
@@ -476,7 +397,7 @@ impl Frame {
     fn read_vfs_request_body(
         request: VfsRequestCode,
         payload: Vec<u8>,
-    ) -> Result<VfsRequestBody, FrameReadError> {
+    ) -> Result<VfsRequestBody, FrameError> {
         match request {
             VfsRequestCode::Attach => Self::read_vfs_attach_request(payload),
             VfsRequestCode::Open => Self::read_vfs_open_request(payload),
@@ -494,11 +415,11 @@ impl Frame {
         }
     }
 
-    fn read_vfs_attach_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+    fn read_vfs_attach_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameError> {
         const ATTACH_FIXED_PAYLOAD_SIZE: usize = 19;
 
         if payload.len() < ATTACH_FIXED_PAYLOAD_SIZE {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS attach payload: expected at least {ATTACH_FIXED_PAYLOAD_SIZE} bytes, found {}",
                     payload.len()
@@ -522,15 +443,15 @@ impl Frame {
         }))
     }
 
-    fn read_vfs_open_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+    fn read_vfs_open_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameError> {
         let Some((&num_buf, extra)) = payload.split_first() else {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: "invalid VFS open payload: expected num_buf byte".to_owned(),
             });
         };
 
         if !extra.is_empty() {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS open payload: expected 1 byte, found {}",
                     payload.len()
@@ -541,9 +462,9 @@ impl Frame {
         Ok(VfsRequestBody::Open(VfsOpenRequest { num_buf }))
     }
 
-    fn read_vfs_read_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+    fn read_vfs_read_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameError> {
         if payload.len() != 2 {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS read payload: expected 2 bytes, found {}",
                     payload.len()
@@ -556,9 +477,9 @@ impl Frame {
         }))
     }
 
-    fn read_vfs_seek_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+    fn read_vfs_seek_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameError> {
         if payload.len() != 5 {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS seek payload: expected 5 bytes, found {}",
                     payload.len()
@@ -572,9 +493,9 @@ impl Frame {
         }))
     }
 
-    fn read_vfs_write_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+    fn read_vfs_write_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameError> {
         if payload.len() < 2 {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS write payload: expected at least 2 bytes, found {}",
                     payload.len()
@@ -585,7 +506,7 @@ impl Frame {
         let data_length = u16::from_le_bytes([payload[0], payload[1]]) as usize;
         let data = payload[2..].to_vec();
         if data.len() != data_length {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS write payload: declared {data_length} bytes, found {}",
                     data.len()
@@ -596,9 +517,9 @@ impl Frame {
         Ok(VfsRequestBody::Write(VfsWriteRequest { data }))
     }
 
-    fn read_empty_vfs_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameReadError> {
+    fn read_empty_vfs_request(payload: Vec<u8>) -> Result<VfsRequestBody, FrameError> {
         if !payload.is_empty() {
-            return Err(FrameReadError::Validation {
+            return Err(FrameError::Validation {
                 reason: format!(
                     "invalid VFS simple payload: expected 0 bytes, found {}",
                     payload.len()
@@ -609,7 +530,7 @@ impl Frame {
         Ok(VfsRequestBody::Simple)
     }
 
-    fn read_signon_properties(mut src: impl io::Read) -> Result<Vec<DataProperty>, FrameReadError> {
+    fn read_signon_properties(mut src: impl io::Read) -> Result<Vec<DataProperty>, FrameError> {
         let mut properties = Vec::<DataProperty>::with_capacity(6);
 
         loop {
@@ -633,44 +554,25 @@ impl Frame {
         Ok(properties)
     }
 
-    fn read_pascal_string(mut src: impl io::Read) -> Result<String, FrameReadError> {
+    fn read_pascal_string(mut src: impl io::Read) -> Result<String, FrameError> {
         let mut length = 0;
         src.read_exact(slice::from_mut(&mut length))?;
 
         let mut raw = vec![0; length as usize];
         src.read_exact(&mut raw)?;
 
-        String::from_utf8(raw).map_err(|err| FrameReadError::Validation {
+        String::from_utf8(raw).map_err(|err| FrameError::Validation {
             reason: format!("invalid string {:02x?}", err.as_bytes()),
         })
     }
 
-    pub fn write_to_io(self, mut dst: impl io::Write) -> io::Result<()> {
-        let frame_data = self.serialize();
-        let crc = Self::crc16_arc(&frame_data);
-
-        // println!("unstuffed response frame data: {frame_data:02x?}");
-
-        let count_of_dle = frame_data.iter().filter(|&&b| b == DLE).count();
-        let frame_data = if count_of_dle == 0 {
-            frame_data
-        } else {
-            let mut stuffed_frame_data = Vec::with_capacity(frame_data.len() + count_of_dle);
-            for b in frame_data.into_iter() {
-                stuffed_frame_data.push(b);
-                if b == DLE {
-                    stuffed_frame_data.push(DLE);
-                }
-            }
-            stuffed_frame_data
-        };
-
-        dst.write_all(&[DLE, STX])?;
-        dst.write_all(&frame_data)?;
-        dst.write_all(&[DLE, ETX])?;
-        dst.write_all(&crc.to_le_bytes())?;
-
-        Ok(())
+    pub fn write_to_io(self, dst: impl io::Write) -> io::Result<usize> {
+        RawFrame::new(self.serialize())
+            .write_to_io(dst)
+            .map_err(|err| match err {
+                FrameError::Io(err) => err,
+                err => io::Error::new(io::ErrorKind::InvalidData, err),
+            })
     }
 
     fn serialize(self) -> Vec<u8> {

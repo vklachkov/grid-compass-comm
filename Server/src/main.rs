@@ -9,9 +9,9 @@ use std::{
 };
 
 use crate::gridlink::{
-    DataFrameBody, Frame, FrameBody, FrameReadError, FrameType, VfsReadResponse, VfsRequest,
-    VfsRequestBody, VfsRequestCode, VfsResponse, VfsSimpleResponse, VipcConnectHeader,
-    VipcMessageBody, VipcMessageHeader, EOM_FLAG_ON,
+    DataFrameBody, EOM_FLAG_ON, Frame, FrameBody, FrameError, FrameType, VfsReadResponse,
+    VfsRequest, VfsRequestBody, VfsRequestCode, VfsResponse, VfsSimpleResponse, VipcConnectHeader,
+    VipcMessageBody, VipcMessageHeader,
 };
 
 const VFS_CLASS: u16 = 83;
@@ -95,7 +95,7 @@ fn try_worker(mut client: TcpStream, addr: SocketAddr) -> io::Result<()> {
     loop {
         let frame = match gridlink::Frame::read_from_io(&mut client) {
             Ok(frame) => frame,
-            Err(FrameReadError::Io(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(FrameError::Io(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
                 println!("worker({addr}): connection closed");
                 return Ok(());
             }
