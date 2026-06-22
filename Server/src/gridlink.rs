@@ -84,6 +84,13 @@ pub enum DataFrameBody {
         header: VipcConnectHeader,
         status: u16,
     },
+    Disconnect {
+        header: VipcConnectHeader,
+        reason: u16,
+    },
+    DisconnectResponse {
+        header: VipcConnectHeader,
+    },
     SignOn {
         properties: Vec<DataProperty>,
     },
@@ -420,6 +427,13 @@ impl Frame {
                 header: Self::read_entity::<VipcConnectHeader>(&mut src)?,
                 path: Self::read_pascal_string(&mut src)?,
             }),
+            VipcProtocolFunctionCode::Disconnect => Ok(DataFrameBody::Disconnect {
+                header: Self::read_entity::<VipcConnectHeader>(&mut src)?,
+                reason: Self::read_entity::<u16>(&mut src)?,
+            }),
+            VipcProtocolFunctionCode::DisconnectResponse => Ok(DataFrameBody::DisconnectResponse {
+                header: Self::read_entity::<VipcConnectHeader>(&mut src)?,
+            }),
             VipcProtocolFunctionCode::Msg => {
                 let header = Self::read_entity::<VipcMessageHeader>(&mut src)?;
                 let mut payload = vec![0; header.data_length as usize];
@@ -669,6 +683,13 @@ impl Frame {
                         .extend((VipcProtocolFunctionCode::ConnectResponse as u16).to_le_bytes());
                     response.extend(header.as_bytes());
                     response.extend(status.to_le_bytes());
+                }
+                DataFrameBody::Disconnect { .. } => unimplemented!(),
+                DataFrameBody::DisconnectResponse { header } => {
+                    response.extend(
+                        (VipcProtocolFunctionCode::DisconnectResponse as u16).to_le_bytes(),
+                    );
+                    response.extend(header.as_bytes());
                 }
                 DataFrameBody::SignOn { .. } => unimplemented!(),
                 DataFrameBody::SignOnResponse {

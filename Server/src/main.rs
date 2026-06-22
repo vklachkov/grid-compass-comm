@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::gridlink::{
-    DataFrameBody, EOM_FLAG_ON, Frame, FrameBody, FrameType, VfsReadResponse, VfsRequest,
-    VfsRequestBody, VfsRequestCode, VfsResponse, VfsSimpleResponse, VipcConnectHeader,
+    DataFrameBody, EOM_FLAG_ON, Frame, FrameBody, FrameReadError, FrameType, VfsReadResponse,
+    VfsRequest, VfsRequestBody, VfsRequestCode, VfsResponse, VfsSimpleResponse, VipcConnectHeader,
     VipcMessageBody, VipcMessageHeader,
 };
 
@@ -81,8 +81,14 @@ fn try_worker(mut client: TcpStream, addr: SocketAddr) -> io::Result<()> {
     let mut vfs_attachments = HashMap::<u16, VfsAttachment>::new();
 
     loop {
-        let frame = gridlink::Frame::read_from_io(&mut client)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let frame = match gridlink::Frame::read_from_io(&mut client) {
+            Ok(frame) => frame,
+            Err(FrameReadError::Io(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                println!("worker({addr}): connection closed");
+                return Ok(());
+            }
+            Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidData, err)),
+        };
 
         println!("worker({addr}): received {frame:#?}");
 
@@ -124,6 +130,27 @@ fn try_worker(mut client: TcpStream, addr: SocketAddr) -> io::Result<()> {
                                     remote_path_id: header.local_path_id,
                                 },
                                 status: 0, // OK
+                            },
+                        )
+                        .write_to_io(&mut client)?;
+                    }
+                    DataFrameBody::Disconnect { header, reason } => {
+                        let local_path_id = header.remote_path_id;
+                        let remote_path_id = header.local_path_id;
+                        println!(
+                            "worker({addr}): VIPC disconnect local_path_id {}, remote_path_id {}, reason {}",
+                            local_path_id, remote_path_id, reason
+                        );
+
+                        seq_number = seq_number.wrapping_add(1);
+                        Frame::data(
+                            seq_number,
+                            EOM_FLAG_ON,
+                            DataFrameBody::DisconnectResponse {
+                                header: VipcConnectHeader {
+                                    local_path_id,
+                                    remote_path_id,
+                                },
                             },
                         )
                         .write_to_io(&mut client)?;
@@ -172,6 +199,7 @@ fn try_worker(mut client: TcpStream, addr: SocketAddr) -> io::Result<()> {
                         return Ok(());
                     }
                     DataFrameBody::ConnectResponse { .. }
+                    | DataFrameBody::DisconnectResponse { .. }
                     | DataFrameBody::SignOnResponse { .. } => {
                         println!("worker({addr}): unexpected outbound-only data body");
                     }
