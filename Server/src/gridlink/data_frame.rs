@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 
 use bstr::BStr;
 
@@ -47,8 +47,15 @@ pub enum DataFrameRequest<'a> {
 
     // VipcMsgType
     Msg {
-        body: &'a [u8], // vipcData
+        header: ConnectHeader,
+        payload: &'a [u8],
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectHeader {
+    pub local_path_id: u16,  // localPathID
+    pub remote_path_id: u16, // remotePathID
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,12 +82,11 @@ pub enum DataFrameResponse<'a> {
         status: u16,           // signOnStatus
         server_name: &'a BStr, // serverNameStr
     },
-}
 
-#[derive(Clone, Copy, Debug)]
-pub struct ConnectHeader {
-    pub local_path_id: u16,  // localPathID
-    pub remote_path_id: u16, // remotePathID
+    Msg {
+        header: ConnectHeader,
+        payload: &'a [u8],
+    },
 }
 
 impl<'a> DataFrameRequest<'a> {
@@ -97,7 +103,7 @@ impl<'a> DataFrameRequest<'a> {
         let body = match ty {
             DataFrameType::Connect => Self::Connect {
                 header: Self::read_connect_header(&mut cursor)?,
-                path: Self::read_nslice(&mut cursor).map(BStr::new)?,
+                path: Self::read_small_slice(&mut cursor).map(BStr::new)?,
             },
             DataFrameType::Disconnect => Self::Disconnect {
                 header: Self::read_connect_header(&mut cursor)?,
@@ -108,7 +114,8 @@ impl<'a> DataFrameRequest<'a> {
             },
             DataFrameType::SignOff => Self::SignOff {},
             DataFrameType::Msg => Self::Msg {
-                body: cursor.read_remainder(),
+                header: Self::read_connect_header(&mut cursor)?,
+                payload: cursor.read_remainder(),
             },
             _ => {
                 return Err(FrameError::Validation {
@@ -139,7 +146,7 @@ impl<'a> DataFrameRequest<'a> {
                 Err(err) => return Err(err.into()),
             };
 
-            let value = Self::read_nslice(cursor)?;
+            let value = Self::read_small_slice(cursor)?;
 
             properties.push(SignOnProperty { ty, value });
         }
@@ -147,7 +154,7 @@ impl<'a> DataFrameRequest<'a> {
         Ok(properties)
     }
 
-    fn read_nslice(cursor: &mut io::Cursor<&'a [u8]>) -> Result<&'a [u8], FrameError> {
+    fn read_small_slice(cursor: &mut io::Cursor<&'a [u8]>) -> Result<&'a [u8], FrameError> {
         let length = cursor.read_u8()?;
         cursor.read_slice(length as usize).map_err(Into::into)
     }
@@ -174,6 +181,11 @@ impl DataFrameResponse<'_> {
                 _ = data.write_u16(DataFrameType::SignOnResponse as u16);
                 _ = data.write_u16(*status);
                 Self::write_nslice(&mut data, server_name);
+            }
+            Self::Msg { header, payload } => {
+                _ = data.write_u16(DataFrameType::Msg as u16);
+                Self::write_connect_header(&mut data, header);
+                _ = data.write_all(payload);
             }
         }
 

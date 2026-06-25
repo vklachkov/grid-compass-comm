@@ -1,12 +1,15 @@
 use bstr::BStr;
 
-#[derive(Clone, Copy, Debug)]
-pub struct VipcMessageHeader {
-    pub local_path_id: u16,  // localPathID
-    pub remote_path_id: u16, // remotePathID
-    pub class: u16,          // class
-    pub note: u16,           // note
-    pub data_length: u16,    // vipcDataLength
+#[derive(Clone, Copy, Debug, strum::FromRepr)]
+#[repr(u16)]
+enum MessageClassType {
+    Vfs = 83,
+}
+
+#[derive(Clone, Debug)]
+pub enum MessageBody<'a> {
+    Vfs(VfsRequest<'a>),
+    Unsupported(&'a [u8]),
 }
 
 #[derive(Clone, Debug)]
@@ -16,7 +19,14 @@ pub struct VfsRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum VfsRequestCode {
+pub struct VfsRequestHeader {
+    pub request: u16,            // vfsRequest
+    pub requestors_conn_id: u16, // requestorsConnID
+    pub servers_conn_id: u16,    // serversConnID
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VfsRequestCode {
     GetStatus = 1,    // ddGetStatus
     Open = 2,         // ddOpen
     Close = 3,        // ddClose
@@ -33,20 +43,20 @@ pub enum VfsRequestCode {
 
 #[derive(Clone, Debug)]
 pub enum VfsRequestBody<'a> {
-    // AttachReqType
-    Attach(VfsAttachRequest<'a>),
-
     // OpenReqType
     Open(VfsOpenRequest),
 
     // ReadReqType
     Read(VfsReadRequest),
 
+    // WriteReqType
+    Write(VfsWriteRequest<'a>),
+
     // SeekReqType
     Seek(VfsSeekRequest),
 
-    // WriteReqType
-    Write(VfsWriteRequest<'a>),
+    // AttachReqType
+    Attach(VfsAttachRequest<'a>),
 
     // SimpleReqType
     Simple,
@@ -82,13 +92,6 @@ pub struct VfsSeekRequest {
 #[derive(Clone, Debug)]
 pub struct VfsWriteRequest<'a> {
     pub data: &'a [u8], // buffer
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct VfsRequestHeader {
-    pub request: u16,            // vfsRequest
-    pub requestors_conn_id: u16, // requestorsConnID
-    pub servers_conn_id: u16,    // serversConnID
 }
 
 #[derive(Clone, Debug)]

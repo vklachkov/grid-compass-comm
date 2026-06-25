@@ -1,14 +1,20 @@
 mod gridlink;
+mod vfs;
+mod vipc;
 
 use std::{
     io,
     net::{SocketAddr, TcpListener, TcpStream},
     process::ExitCode,
+    rc::Rc,
     thread,
 };
 
 use bstr::BStr;
+
 use gridlink::*;
+use vfs::Vfs;
+use vipc::Vipc;
 
 #[derive(PartialEq, Eq)]
 enum ProcessFrameResult {
@@ -54,11 +60,15 @@ fn worker(client: TcpStream, addr: SocketAddr) {
 }
 
 fn try_worker(client: TcpStream, addr: SocketAddr) -> io::Result<()> {
+    let vfs = Rc::new(Box::new(Vfs::new()));
+
     let mut session = Session {
         client: client,
         // TODO: automatically choose the connection ID from the available IDs.
         connection_id: 0x7B,
         last_seq_number: 0x1C,
+        vfs: vfs.clone(),
+        vipc: Box::new(Vipc::new(vfs)),
     };
 
     loop {
@@ -88,6 +98,8 @@ struct Session {
     client: TcpStream,
     connection_id: u8,
     last_seq_number: u8,
+    vfs: Rc<Box<Vfs>>,
+    vipc: Box<Vipc>,
 }
 
 impl Session {
@@ -152,8 +164,8 @@ impl Session {
             DataFrameRequest::SignOff {} => {
                 self.sign_off()
             }
-            DataFrameRequest::Msg { body } => {
-                self.process_msg(body)
+            DataFrameRequest::Msg { header, payload } => {
+                self.process_msg(header, payload)
             }
         }
     }
@@ -215,49 +227,8 @@ impl Session {
         Ok(())
     }
 
-    fn process_msg(&mut self, _msg: &[u8]) -> Result<(), FrameError> {
-        unimplemented!();
-
-        // let response = match body {
-        //                             VipcMessageBody::VfsRequest(request) => handle_vfs_request(
-        //                                 addr,
-        //                                 header,
-        //                                 request,
-        //                                 &mut last_vfs_conn_id,
-        //                                 &mut vfs_attachments,
-        //                             ),
-        //                             VipcMessageBody::Raw(raw)
-        //                                 if header.class == GENERAL_BROADCAST_CLASS =>
-        //                             {
-        //                                 let class = header.class;
-        //                                 let note = header.note;
-        //                                 println!(
-        //                                     "worker({addr}): general broadcast class {}, note {}, {} bytes",
-        //                                     class,
-        //                                     note,
-        //                                     raw.len()
-        //                                 );
-        //                                 Some(vipc_raw_message_response(header, raw.clone()))
-        //                             }
-        //                             VipcMessageBody::Raw(raw) => {
-        //                                 let class = header.class;
-        //                                 println!(
-        //                                     "worker({addr}): unsupported VIPC message class {}, {} bytes",
-        //                                     class,
-        //                                     raw.len()
-        //                                 );
-        //                                 None
-        //                             }
-        //                             VipcMessageBody::VfsResponse(_) => None,
-        //                         };
-
-        //                         if let Some(response) = response {
-        //                             seq_number = seq_number.wrapping_add(1);
-        //                             Frame::data(seq_number, EOM_FLAG_ON, response)
-        //                                 .write_to_io(&mut client)?;
-        //                         }
-
-        todo!()
+    fn process_msg(&mut self, header: ConnectHeader, payload: &[u8]) -> Result<(), FrameError> {
+        self.vipc.process_message(header, payload)
     }
 
     fn write_response(&mut self, body: &[u8]) -> Result<(), FrameError> {
