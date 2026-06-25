@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+bstr = { version = "1.12.1", default-features = false }
+log = "0.4.33"
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
-zerocopy = { version = "0.8.52", features = ["derive", "std"] }

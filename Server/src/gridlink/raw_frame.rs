@@ -1,6 +1,9 @@
-use std::{io, slice};
+use std::io;
 
-use super::error::FrameError;
+use super::{
+    error::FrameError,
+    utils::{ReadExt, WriteExt},
+};
 
 /// Data Link Escape. Used to prefix special commands or escape data bytes.
 const DLE: u8 = 0x10;
@@ -30,10 +33,8 @@ impl RawFrame {
         let buffer = Self::read_unstuffed(&mut src)?;
         let buffer_crc = crc16(&buffer);
 
-        let mut crc = [0u8; 2];
-        src.read_exact(&mut crc)?;
+        let crc = src.read_u16()?;
 
-        let crc = u16::from_le_bytes(crc);
         if crc != buffer_crc {
             return Err(FrameError::InvalidCrc {
                 expected: buffer_crc,
@@ -45,7 +46,6 @@ impl RawFrame {
     }
 
     fn read_unstuffed(mut src: impl io::Read) -> Result<Vec<u8>, FrameError> {
-        let mut byte = 0u8;
         let mut buffer = Vec::with_capacity(AVERAGE_FRAME_SIZE);
 
         loop {
@@ -55,13 +55,13 @@ impl RawFrame {
                 });
             }
 
-            src.read_exact(slice::from_mut(&mut byte))?;
+            let byte = src.read_u8()?;
             if byte != DLE {
                 buffer.push(byte);
                 continue;
             }
 
-            src.read_exact(slice::from_mut(&mut byte))?;
+            let byte = src.read_u8()?;
             match byte {
                 DLE => buffer.push(DLE),
                 STX => buffer.clear(),
@@ -76,7 +76,7 @@ impl RawFrame {
     }
 
     /// Stuffs and writes frame data to an I/O destination.
-    pub fn write_to_io(&self, dst: impl io::Write) -> Result<usize, FrameError> {
+    pub fn write_to_io(&self, dst: impl io::Write) -> Result<(), FrameError> {
         let crc = crc16(&self.data);
 
         let count_of_dle = self.data.iter().filter(|&&b| b == DLE).count();
@@ -95,22 +95,15 @@ impl RawFrame {
         Self::write_stuffed(dst, &stuffed_frame_data, crc)
     }
 
-    fn write_stuffed(mut dst: impl io::Write, data: &[u8], crc: u16) -> Result<usize, FrameError> {
-        let mut total = 0;
+    fn write_stuffed(mut dst: impl io::Write, data: &[u8], crc: u16) -> Result<(), FrameError> {
+        println!("write data stuffed: {data:02x?}");
 
         dst.write_all(&[DLE, STX])?;
-        total += 2;
-
         dst.write_all(data)?;
-        total += data.len();
-
         dst.write_all(&[DLE, ETX])?;
-        total += 2;
+        dst.write_u16(crc)?;
 
-        dst.write_all(&crc.to_le_bytes())?;
-        total += 2;
-
-        Ok(total)
+        Ok(())
     }
 }
 
