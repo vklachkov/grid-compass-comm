@@ -79,7 +79,7 @@ pub enum VfsRequestBody<'a> {
     WriteDesc(VfsWriteRequest<'a>),
 
     // WriteReqType
-    SetStatus(VfsWriteRequest<'a>),
+    SetStatus(VfsSetStatusRequest<'a>),
 
     // SeekReqType
     Seek(VfsSeekRequest),
@@ -122,6 +122,88 @@ pub struct VfsSeekRequest {
 #[derive(Clone, Debug)]
 pub struct VfsWriteRequest<'a> {
     pub data: &'a [u8], // buffer
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsSetStatusRequest<'a> {
+    pub actions: Vec<VfsSetStatusAction<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, strum::FromRepr)]
+#[repr(u8)]
+pub enum VfsSetStatusType {
+    SetDirection = 255,
+    SetWildcard = 254,
+    SetObjectMode = 253,
+    SetGpibAddress = 252,
+    SetDeviceMask = 251,
+    SetNoteValue = 250,
+    SetNumBuffers = 249,
+    SetNameAttributes = 248,
+    SetConsoleMode = 247,
+    SetAccessRights = 246,
+    SetSecureMode = 245,
+    SetIpcActivityTimeout = 244,
+    GetGenericDeviceName = 243,
+    GetDeviceName = 242,
+}
+
+#[derive(Clone, Debug)]
+pub enum VfsSetStatusAction<'a> {
+    SetDirection {
+        raw: &'a [u8],
+    },
+    SetWildcard {
+        pattern: &'a BStr,
+    },
+    SetObjectMode {
+        mode: VfsObjectMode,
+    },
+    SetGpibAddress {
+        raw: &'a [u8],
+    },
+    SetDeviceMask {
+        raw: &'a [u8],
+    },
+    SetNoteValue {
+        raw: &'a [u8],
+    },
+    SetNumBuffers {
+        raw: &'a [u8],
+    },
+    SetNameAttributes {
+        raw: &'a [u8],
+    },
+    SetConsoleMode {
+        raw: &'a [u8],
+    },
+    SetAccessRights {
+        raw: &'a [u8],
+    },
+    SetSecureMode {
+        raw: &'a [u8],
+    },
+    SetIpcActivityTimeout {
+        raw: &'a [u8],
+    },
+    GetGenericDeviceName {
+        raw: &'a [u8],
+    },
+    GetDeviceName {
+        raw: &'a [u8],
+    },
+    Unknown {
+        ty: u8,
+        raw: &'a [u8],
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::FromRepr)]
+#[repr(u8)]
+pub enum VfsObjectMode {
+    Byte = 0,
+    Directory = 1,
+    CompleteDirectory = 2,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,7 +298,7 @@ impl<'a> IncomingMessage<'a> {
                 Self::read_vfs_write_request(&mut cursor).map(VfsRequestBody::WriteDesc)?
             }
             Some(VfsRequestCode::SetStatus) => {
-                Self::read_vfs_write_request(&mut cursor).map(VfsRequestBody::SetStatus)?
+                Self::read_vfs_set_status_request(&mut cursor)? //
             }
             Some(VfsRequestCode::Detach) => {
                 Self::read_detach_vfs_request(&cursor)? //
@@ -300,6 +382,30 @@ impl<'a> IncomingMessage<'a> {
         Ok(VfsWriteRequest { data })
     }
 
+    fn read_vfs_set_status_request(
+        cursor: &mut io::Cursor<&'a [u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        let data_length = cursor.read_u16()? as usize;
+        let data = cursor.read_slice(data_length)?;
+
+        Self::ensure_empty(cursor, "VFS set status payload")?;
+
+        let mut data_cursor = io::Cursor::new(data);
+        let mut actions = Vec::new();
+
+        while data_cursor.position() < data.len() as u64 {
+            let ty = data_cursor.read_u8()?;
+            let length = data_cursor.read_u16()? as usize;
+            let raw = data_cursor.read_slice(length)?;
+
+            actions.push(VfsSetStatusAction::from_raw(ty, raw)?);
+        }
+
+        Self::ensure_empty(&data_cursor, "VFS set status data")?;
+
+        Ok(VfsRequestBody::SetStatus(VfsSetStatusRequest { actions }))
+    }
+
     fn read_detach_vfs_request(
         cursor: &io::Cursor<&[u8]>,
     ) -> Result<VfsRequestBody<'a>, FrameError> {
@@ -378,5 +484,54 @@ impl OutgoingMessage {
         dst.extend(header.servers_conn_id.to_le_bytes());
         dst.extend(header.requestors_conn_id.to_le_bytes());
         dst.extend(header.error.to_le_bytes());
+    }
+}
+
+impl<'a> VfsSetStatusAction<'a> {
+    fn from_raw(ty: u8, raw: &'a [u8]) -> Result<Self, FrameError> {
+        let Some(ty) = VfsSetStatusType::from_repr(ty) else {
+            return Ok(Self::Unknown { ty, raw });
+        };
+
+        let action = match ty {
+            VfsSetStatusType::SetDirection => Self::SetDirection { raw },
+            VfsSetStatusType::SetWildcard => Self::SetWildcard {
+                pattern: BStr::new(raw),
+            },
+            VfsSetStatusType::SetObjectMode => Self::parse_object_mode(raw)?,
+            VfsSetStatusType::SetGpibAddress => Self::SetGpibAddress { raw },
+            VfsSetStatusType::SetDeviceMask => Self::SetDeviceMask { raw },
+            VfsSetStatusType::SetNoteValue => Self::SetNoteValue { raw },
+            VfsSetStatusType::SetNumBuffers => Self::SetNumBuffers { raw },
+            VfsSetStatusType::SetNameAttributes => Self::SetNameAttributes { raw },
+            VfsSetStatusType::SetConsoleMode => Self::SetConsoleMode { raw },
+            VfsSetStatusType::SetAccessRights => Self::SetAccessRights { raw },
+            VfsSetStatusType::SetSecureMode => Self::SetSecureMode { raw },
+            VfsSetStatusType::SetIpcActivityTimeout => Self::SetIpcActivityTimeout { raw },
+            VfsSetStatusType::GetGenericDeviceName => Self::GetGenericDeviceName { raw },
+            VfsSetStatusType::GetDeviceName => Self::GetDeviceName { raw },
+        };
+
+        Ok(action)
+    }
+
+    fn parse_object_mode(raw: &[u8]) -> Result<Self, FrameError> {
+        if raw.len() != 1 {
+            return Err(FrameError::Validation {
+                reason: format!(
+                    "invalid VFS set object mode length: expected 1, found {}",
+                    raw.len()
+                ),
+            });
+        }
+
+        let raw_mode = raw[0];
+        let Some(mode) = VfsObjectMode::from_repr(raw_mode) else {
+            return Err(FrameError::Validation {
+                reason: format!("invalid VFS object mode: {raw_mode}"),
+            });
+        };
+
+        Ok(Self::SetObjectMode { mode })
     }
 }

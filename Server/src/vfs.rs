@@ -147,7 +147,7 @@ impl Vfs {
     fn set_status(
         &mut self,
         header: &VfsRequestHeader,
-        _body: VfsWriteRequest<'_>,
+        _body: VfsSetStatusRequest<'_>,
     ) -> OutgoingMessageBody {
         // TODO
 
