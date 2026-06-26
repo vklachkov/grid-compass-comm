@@ -57,14 +57,29 @@ pub enum VfsRequestCode {
 
 #[derive(Clone, Debug)]
 pub enum VfsRequestBody<'a> {
+    // ReadReqType
+    GetStatus(VfsReadRequest),
+
     // OpenReqType
     Open(VfsOpenRequest),
 
     // ReadReqType
     Read(VfsReadRequest),
 
+    // ReadReqType
+    ReadDesc(VfsReadRequest),
+
+    // ReadReqType
+    ReadDirPage(VfsReadRequest),
+
     // WriteReqType
     Write(VfsWriteRequest<'a>),
+
+    // WriteReqType
+    WriteDesc(VfsWriteRequest<'a>),
+
+    // WriteReqType
+    SetStatus(VfsWriteRequest<'a>),
 
     // SeekReqType
     Seek(VfsSeekRequest),
@@ -72,8 +87,9 @@ pub enum VfsRequestBody<'a> {
     // AttachReqType
     Attach(VfsAttachRequest<'a>),
 
-    // SimpleReqType
-    Simple,
+    Detach,
+
+    Close,
 
     // raw
     Unknown(&'a [u8]),
@@ -164,22 +180,45 @@ impl<'a> IncomingMessage<'a> {
         let header = Self::read_vfs_request_header(&mut cursor)?;
 
         let body = match VfsRequestCode::from_repr(header.request) {
-            Some(VfsRequestCode::Attach) => Self::read_vfs_attach_request(&mut cursor)?,
-            Some(VfsRequestCode::Open) => Self::read_vfs_open_request(&mut cursor)?,
-            Some(
-                VfsRequestCode::GetStatus
-                | VfsRequestCode::Read
-                | VfsRequestCode::ReadDesc
-                | VfsRequestCode::ReadDirPage,
-            ) => Self::read_vfs_read_request(&mut cursor)?,
-            Some(VfsRequestCode::Seek) => Self::read_vfs_seek_request(&mut cursor)?,
-            Some(VfsRequestCode::Write | VfsRequestCode::WriteDesc | VfsRequestCode::SetStatus) => {
-                Self::read_vfs_write_request(&mut cursor)?
+            Some(VfsRequestCode::Attach) => {
+                Self::read_vfs_attach_request(&mut cursor)? //
             }
-            Some(VfsRequestCode::Close | VfsRequestCode::Detach) => {
-                Self::read_empty_vfs_request(&cursor)?
+            Some(VfsRequestCode::Open) => {
+                Self::read_vfs_open_request(&mut cursor)? //
             }
-            None => VfsRequestBody::Unknown(cursor.read_remainder()),
+            Some(VfsRequestCode::GetStatus) => {
+                Self::read_vfs_read_request(&mut cursor).map(VfsRequestBody::GetStatus)?
+            }
+            Some(VfsRequestCode::Read) => {
+                Self::read_vfs_read_request(&mut cursor).map(VfsRequestBody::Read)?
+            }
+            Some(VfsRequestCode::ReadDesc) => {
+                Self::read_vfs_read_request(&mut cursor).map(VfsRequestBody::ReadDesc)?
+            }
+            Some(VfsRequestCode::ReadDirPage) => {
+                Self::read_vfs_read_request(&mut cursor).map(VfsRequestBody::ReadDirPage)?
+            }
+            Some(VfsRequestCode::Seek) => {
+                Self::read_vfs_seek_request(&mut cursor)? //
+            }
+            Some(VfsRequestCode::Write) => {
+                Self::read_vfs_write_request(&mut cursor).map(VfsRequestBody::Write)?
+            }
+            Some(VfsRequestCode::WriteDesc) => {
+                Self::read_vfs_write_request(&mut cursor).map(VfsRequestBody::WriteDesc)?
+            }
+            Some(VfsRequestCode::SetStatus) => {
+                Self::read_vfs_write_request(&mut cursor).map(VfsRequestBody::SetStatus)?
+            }
+            Some(VfsRequestCode::Detach) => {
+                Self::read_detach_vfs_request(&cursor)? //
+            }
+            Some(VfsRequestCode::Close) => {
+                Self::read_close_vfs_request(&cursor)? //
+            }
+            None => {
+                VfsRequestBody::Unknown(cursor.read_remainder()) //
+            }
         };
 
         Ok(VfsRequest { header, body })
@@ -223,14 +262,12 @@ impl<'a> IncomingMessage<'a> {
         Ok(VfsRequestBody::Open(VfsOpenRequest { num_buf }))
     }
 
-    fn read_vfs_read_request(
-        cursor: &mut io::Cursor<&[u8]>,
-    ) -> Result<VfsRequestBody<'a>, FrameError> {
+    fn read_vfs_read_request(cursor: &mut io::Cursor<&[u8]>) -> Result<VfsReadRequest, FrameError> {
         let data_length = cursor.read_u16()?;
 
         Self::ensure_empty(cursor, "VFS read payload")?;
 
-        Ok(VfsRequestBody::Read(VfsReadRequest { data_length }))
+        Ok(VfsReadRequest { data_length })
     }
 
     fn read_vfs_seek_request(
@@ -246,20 +283,27 @@ impl<'a> IncomingMessage<'a> {
 
     fn read_vfs_write_request(
         cursor: &mut io::Cursor<&'a [u8]>,
-    ) -> Result<VfsRequestBody<'a>, FrameError> {
+    ) -> Result<VfsWriteRequest<'a>, FrameError> {
         let data_length = cursor.read_u16()? as usize;
         let data = cursor.read_slice(data_length)?;
 
         Self::ensure_empty(cursor, "VFS write payload")?;
 
-        Ok(VfsRequestBody::Write(VfsWriteRequest { data }))
+        Ok(VfsWriteRequest { data })
     }
 
-    fn read_empty_vfs_request(
+    fn read_detach_vfs_request(
         cursor: &io::Cursor<&[u8]>,
     ) -> Result<VfsRequestBody<'a>, FrameError> {
-        Self::ensure_empty(cursor, "VFS simple payload")?;
-        Ok(VfsRequestBody::Simple)
+        Self::ensure_empty(cursor, "VFS detach payload")?;
+        Ok(VfsRequestBody::Detach)
+    }
+
+    fn read_close_vfs_request(
+        cursor: &io::Cursor<&[u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        Self::ensure_empty(cursor, "VFS close payload")?;
+        Ok(VfsRequestBody::Close)
     }
 
     fn read_small_slice(cursor: &mut io::Cursor<&'a [u8]>) -> Result<&'a [u8], FrameError> {
