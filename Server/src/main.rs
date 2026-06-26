@@ -226,7 +226,9 @@ impl Session {
     }
 
     fn process_msg(&mut self, header: ConnectHeader, payload: &[u8]) -> Result<(), FrameError> {
-        let outgoing = self.vipc.process_message(payload)?;
+        let Some(outgoing) = self.vipc.process_message(payload)? else {
+            return Ok(());
+        };
 
         let response = DataFrameResponse::Msg {
             header: ConnectHeader {
