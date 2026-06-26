@@ -8,6 +8,14 @@ pub const EOM_FLAG_ON: u8 = 1;
 /// Phone data link protocol version bytes.
 const PDL_VERSION: [u8; 2] = [b'0', b'2'];
 
+#[derive(Clone, Copy, Debug)]
+pub struct Frame<'a> {
+    pub flags: u8,           // flags
+    pub window_size: u8,     // windowSize
+    pub seq_number: u8,      // seqNumber
+    pub body: FrameBody<'a>, // frameType combined with data
+}
+
 #[derive(Clone, Copy, Debug, strum::FromRepr)]
 #[repr(u8)]
 enum FrameType {
@@ -16,14 +24,6 @@ enum FrameType {
     Disc = 3,
     Ping = 4,
     Data = 5,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Frame<'a> {
-    pub flags: u8,           // flags
-    pub window_size: u8,     // windowSize
-    pub seq_number: u8,      // seqNumber
-    pub body: FrameBody<'a>, // frameType combined with data
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -123,17 +123,8 @@ impl<'a> Frame<'a> {
     }
 
     pub fn to_raw(&self) -> RawFrame {
-        // TODO: Can we set FrameBody discriminants to FrameType and remove match?
-        let ty = match self.body {
-            FrameBody::Rfc(_) => FrameType::Rfc,
-            FrameBody::Ack(_) => FrameType::Ack,
-            FrameBody::Disc(_) => FrameType::Disc,
-            FrameBody::Ping(_) => FrameType::Ping,
-            FrameBody::Data(_) => FrameType::Data,
-        };
-
         let mut data = Vec::with_capacity(5);
-        data.push(ty as u8);
+        data.push(self.body.to_repr());
         data.push(self.flags);
         data.push(self.window_size);
         data.push(self.seq_number);
@@ -152,5 +143,17 @@ impl<'a> Frame<'a> {
         }
 
         RawFrame::new(data)
+    }
+}
+
+impl FrameBody<'_> {
+    fn to_repr(&self) -> u8 {
+        (match self {
+            FrameBody::Rfc(_) => FrameType::Rfc,
+            FrameBody::Ack(_) => FrameType::Ack,
+            FrameBody::Disc(_) => FrameType::Disc,
+            FrameBody::Ping(_) => FrameType::Ping,
+            FrameBody::Data(_) => FrameType::Data,
+        }) as u8
     }
 }

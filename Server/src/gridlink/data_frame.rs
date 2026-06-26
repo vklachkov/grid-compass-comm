@@ -162,43 +162,50 @@ impl<'a> DataFrameRequest<'a> {
 
 impl DataFrameResponse<'_> {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut data = io::Cursor::new(Vec::with_capacity(6));
+        let mut data = Vec::with_capacity(6);
+
+        data.extend(self.to_repr().to_le_bytes());
 
         match self {
             Self::Connect { header, status } => {
-                _ = data.write_u16(DataFrameType::ConnectResponse as u16);
                 Self::write_connect_header(&mut data, header);
-                _ = data.write_u16(*status);
+                data.extend(status.to_le_bytes());
             }
             Self::Disconnect { header } => {
-                data.write_u16(DataFrameType::DisconnectResponse as u16);
                 Self::write_connect_header(&mut data, header);
             }
             Self::SignOn {
                 status,
                 server_name,
             } => {
-                _ = data.write_u16(DataFrameType::SignOnResponse as u16);
-                _ = data.write_u16(*status);
+                data.extend(status.to_le_bytes());
                 Self::write_nslice(&mut data, server_name);
             }
             Self::Msg { header, payload } => {
-                _ = data.write_u16(DataFrameType::Msg as u16);
                 Self::write_connect_header(&mut data, header);
-                _ = data.write_all(payload);
+                data.extend_from_slice(payload);
             }
         }
 
-        data.into_inner()
+        data
     }
 
-    fn write_connect_header(mut dst: impl WriteExt, header: &ConnectHeader) {
-        _ = dst.write_u16(header.local_path_id);
-        _ = dst.write_u16(header.remote_path_id);
+    fn to_repr(&self) -> u16 {
+        (match self {
+            Self::Connect { .. } => DataFrameType::ConnectResponse,
+            Self::Disconnect { .. } => DataFrameType::DisconnectResponse,
+            Self::SignOn { .. } => DataFrameType::SignOnResponse,
+            Self::Msg { .. } => DataFrameType::Msg,
+        }) as u16
     }
 
-    fn write_nslice(mut dst: impl WriteExt, value: &[u8]) {
-        _ = dst.write_u8(value.len() as u8);
-        _ = dst.write_all(value);
+    fn write_connect_header(dst: &mut Vec<u8>, header: &ConnectHeader) {
+        dst.extend(header.local_path_id.to_le_bytes());
+        dst.extend(header.remote_path_id.to_le_bytes());
+    }
+
+    fn write_nslice(dst: &mut Vec<u8>, value: &[u8]) {
+        dst.push(value.len() as u8);
+        dst.extend_from_slice(value);
     }
 }

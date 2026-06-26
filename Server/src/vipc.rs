@@ -16,35 +16,15 @@ impl Vipc {
         header: ConnectHeader,
         payload: &[u8],
     ) -> Result<(), FrameError> {
-        // match header.class {
-        //     MessageClass::Vfs => self.process_vfs_req(&header, data),
-        //     MessageClass::Unsupported(class) => todo!(),
-        // }
+        let message = IpcMessage::try_from_slice(payload)?;
+
+        match message.body {
+            IpcMessageBody::Vfs(req) => self.process_vfs_req(req),
+            IpcMessageBody::Unsupported(raw) => todo!(),
+        }
 
         Ok(())
     }
 
-    fn process_vfs_req(&mut self /* header: &MessageHeader, data: &[u8] */) {
-        // let mut payload_reader = io::Cursor::new(payload);
-        //                     // TODO: make protocol integer decoding explicit before supporting BE machines.
-        //                     let request_header =
-        //                         Self::read_entity::<VfsRequestHeader>(&mut payload_reader)?;
-        //                     let mut request_payload = Vec::new();
-        //                     io::Read::read_to_end(&mut payload_reader, &mut request_payload)?;
-
-        //                     VipcMessageBody::VfsRequest(VfsRequest {
-        //                         header: request_header,
-        //                         body: Self::read_vfs_request_body(
-        //                             VfsRequestCode::from_raw(request_header.request),
-        //                             request_payload,
-        //                         )?,
-        //                     })
-        // self.vfs.handle_vfs_request(
-        //                                 addr,
-        //                                 header,
-        //                                 request,
-        //                                 &mut last_vfs_conn_id,
-        //                                 &mut vfs_attachments,
-        //                             )
-    }
+    fn process_vfs_req(&mut self, req: VfsRequest) {}
 }

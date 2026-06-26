@@ -224,6 +224,7 @@ impl Session {
         println!("session: requested sign off");
 
         // TODO: Sign off properly.
+
         Ok(())
     }
 

@@ -1,13 +1,26 @@
+use std::io;
+
 use bstr::BStr;
+
+use super::{
+    error::FrameError,
+    utils::{CursorExt, ReadExt},
+};
+
+#[derive(Clone, Debug)]
+pub struct IpcMessage<'a> {
+    pub note: u16,                // note
+    pub body: IpcMessageBody<'a>, // class + payload
+}
 
 #[derive(Clone, Copy, Debug, strum::FromRepr)]
 #[repr(u16)]
-enum MessageClassType {
+enum IpcMessageClassType {
     Vfs = 83,
 }
 
 #[derive(Clone, Debug)]
-pub enum MessageBody<'a> {
+pub enum IpcMessageBody<'a> {
     Vfs(VfsRequest<'a>),
     Unsupported(&'a [u8]),
 }
@@ -25,7 +38,8 @@ pub struct VfsRequestHeader {
     pub servers_conn_id: u16,    // serversConnID
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, strum::FromRepr)]
+#[repr(u16)]
 enum VfsRequestCode {
     GetStatus = 1,    // ddGetStatus
     Open = 2,         // ddOpen
@@ -62,7 +76,7 @@ pub enum VfsRequestBody<'a> {
     Simple,
 
     // raw
-    Raw(Vec<u8>),
+    Unknown(&'a [u8]),
 }
 
 #[derive(Clone, Debug)]
@@ -116,4 +130,148 @@ pub struct VfsReadResponse<'a> {
     pub common: VfsSimpleResponse, // VfsRespCommonPart
     pub data_length: u16,          // vfsDatalength
     pub data: &'a [u8],            // buffer
+}
+
+impl<'a> IpcMessage<'a> {
+    pub fn try_from_slice(data: &'a [u8]) -> Result<Self, FrameError> {
+        let mut cursor = io::Cursor::new(data);
+
+        let class = cursor.read_u16()?;
+        let note = cursor.read_u16()?;
+        let data_length = cursor.read_u16()? as usize;
+        let payload = cursor.read_slice(data_length)?;
+
+        Self::ensure_empty(&cursor, "VIPC message")?;
+
+        let body = match IpcMessageClassType::from_repr(class) {
+            Some(IpcMessageClassType::Vfs) => IpcMessageBody::Vfs(Self::read_vfs_request(payload)?),
+            None => IpcMessageBody::Unsupported(payload),
+        };
+
+        Ok(Self { note, body })
+    }
+
+    fn read_vfs_request(data: &'a [u8]) -> Result<VfsRequest<'a>, FrameError> {
+        let mut cursor = io::Cursor::new(data);
+
+        let header = Self::read_vfs_request_header(&mut cursor)?;
+
+        let body = match VfsRequestCode::from_repr(header.request) {
+            Some(VfsRequestCode::Attach) => Self::read_vfs_attach_request(&mut cursor)?,
+            Some(VfsRequestCode::Open) => Self::read_vfs_open_request(&mut cursor)?,
+            Some(
+                VfsRequestCode::GetStatus
+                | VfsRequestCode::Read
+                | VfsRequestCode::ReadDesc
+                | VfsRequestCode::ReadDirPage,
+            ) => Self::read_vfs_read_request(&mut cursor)?,
+            Some(VfsRequestCode::Seek) => Self::read_vfs_seek_request(&mut cursor)?,
+            Some(VfsRequestCode::Write | VfsRequestCode::WriteDesc | VfsRequestCode::SetStatus) => {
+                Self::read_vfs_write_request(&mut cursor)?
+            }
+            Some(VfsRequestCode::Close | VfsRequestCode::Detach) => {
+                Self::read_empty_vfs_request(&cursor)?
+            }
+            None => VfsRequestBody::Unknown(cursor.read_remainder()),
+        };
+
+        Ok(VfsRequest { header, body })
+    }
+
+    fn read_vfs_request_header(
+        cursor: &mut io::Cursor<&[u8]>,
+    ) -> Result<VfsRequestHeader, FrameError> {
+        Ok(VfsRequestHeader {
+            request: cursor.read_u16()?,
+            requestors_conn_id: cursor.read_u16()?,
+            servers_conn_id: cursor.read_u16()?,
+        })
+    }
+
+    fn read_vfs_attach_request(
+        cursor: &mut io::Cursor<&'a [u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        let mode = cursor.read_u8()?;
+        let access = cursor.read_u8()?;
+        let password = cursor.read_array()?;
+        let path = Self::read_small_slice(cursor).map(BStr::new)?;
+
+        Self::ensure_empty(cursor, "VFS attach payload")?;
+
+        Ok(VfsRequestBody::Attach(VfsAttachRequest {
+            mode,
+            access,
+            password,
+            path,
+        }))
+    }
+
+    fn read_vfs_open_request(
+        cursor: &mut io::Cursor<&[u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        let num_buf = cursor.read_u8()?;
+
+        Self::ensure_empty(cursor, "VFS open payload")?;
+
+        Ok(VfsRequestBody::Open(VfsOpenRequest { num_buf }))
+    }
+
+    fn read_vfs_read_request(
+        cursor: &mut io::Cursor<&[u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        let data_length = cursor.read_u16()?;
+
+        Self::ensure_empty(cursor, "VFS read payload")?;
+
+        Ok(VfsRequestBody::Read(VfsReadRequest { data_length }))
+    }
+
+    fn read_vfs_seek_request(
+        cursor: &mut io::Cursor<&[u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        let mode = cursor.read_u8()?;
+        let position = cursor.read_u32()?;
+
+        Self::ensure_empty(cursor, "VFS seek payload")?;
+
+        Ok(VfsRequestBody::Seek(VfsSeekRequest { mode, position }))
+    }
+
+    fn read_vfs_write_request(
+        cursor: &mut io::Cursor<&'a [u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        let data_length = cursor.read_u16()? as usize;
+        let data = cursor.read_slice(data_length)?;
+
+        Self::ensure_empty(cursor, "VFS write payload")?;
+
+        Ok(VfsRequestBody::Write(VfsWriteRequest { data }))
+    }
+
+    fn read_empty_vfs_request(
+        cursor: &io::Cursor<&[u8]>,
+    ) -> Result<VfsRequestBody<'a>, FrameError> {
+        Self::ensure_empty(cursor, "VFS simple payload")?;
+        Ok(VfsRequestBody::Simple)
+    }
+
+    fn read_small_slice(cursor: &mut io::Cursor<&'a [u8]>) -> Result<&'a [u8], FrameError> {
+        let length = cursor.read_u8()?;
+        cursor.read_slice(length as usize).map_err(Into::into)
+    }
+
+    fn ensure_empty(cursor: &io::Cursor<&[u8]>, context: &str) -> Result<(), FrameError> {
+        let remaining = cursor
+            .get_ref()
+            .len()
+            .saturating_sub(cursor.position() as usize);
+
+        if remaining == 0 {
+            return Ok(());
+        }
+
+        Err(FrameError::Validation {
+            reason: format!("{context}: {remaining} trailing bytes"),
+        })
+    }
 }
