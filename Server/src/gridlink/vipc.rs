@@ -22,7 +22,7 @@ pub struct IncomingMessage<'a> {
 #[derive(Clone, Debug)]
 pub enum IncomingMessageBody<'a> {
     Vfs(VfsRequest<'a>),
-    Unsupported(&'a [u8]),
+    Unsupported(UnknownRequest<'a>),
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +124,12 @@ pub struct VfsWriteRequest<'a> {
     pub data: &'a [u8], // buffer
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct UnknownRequest<'a> {
+    class: u16,
+    payload: &'a [u8],
+}
+
 #[derive(Clone, Debug)]
 pub struct OutgoingMessage {
     pub note: u16,                 // note
@@ -162,13 +168,15 @@ impl<'a> IncomingMessage<'a> {
         let data_length = cursor.read_u16()? as usize;
         let payload = cursor.read_slice(data_length)?;
 
-        Self::ensure_empty(&cursor, " message")?;
+        Self::ensure_empty(&cursor, "VIPC message")?;
 
         let body = match MessageClassType::from_repr(class) {
             Some(MessageClassType::Vfs) => {
                 IncomingMessageBody::Vfs(Self::read_vfs_request(payload)?)
             }
-            None => IncomingMessageBody::Unsupported(payload),
+            None => {
+                IncomingMessageBody::Unsupported(UnknownRequest { class, payload }) //
+            }
         };
 
         Ok(Self { note, body })
