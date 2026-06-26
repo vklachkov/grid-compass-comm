@@ -1,30 +1,27 @@
-use std::rc::Rc;
-
-use crate::{gridlink::*, vfs::Vfs};
+use crate::{gridlink::FrameError, gridlink::vipc::*, vfs::Vfs};
 
 pub struct Vipc {
-    vfs: Rc<Box<Vfs>>,
+    vfs: Box<Vfs>,
 }
 
 impl Vipc {
-    pub fn new(vfs: Rc<Box<Vfs>>) -> Self {
+    pub fn new(vfs: Box<Vfs>) -> Self {
         Self { vfs }
     }
 
-    pub fn process_message(
-        &mut self,
-        header: ConnectHeader,
-        payload: &[u8],
-    ) -> Result<(), FrameError> {
-        let message = IpcMessage::try_from_slice(payload)?;
+    pub fn process_message(&mut self, payload: &[u8]) -> Result<OutgoingMessage, FrameError> {
+        let message = IncomingMessage::try_from_slice(payload)?;
 
-        match message.body {
-            IpcMessageBody::Vfs(req) => self.process_vfs_req(req),
-            IpcMessageBody::Unsupported(raw) => todo!(),
-        }
+        println!("session: received vipc message: {message:?}");
 
-        Ok(())
+        let response = match message.body {
+            IncomingMessageBody::Vfs(req) => self.vfs.process_request(req),
+            IncomingMessageBody::Unsupported(_raw) => todo!(),
+        };
+
+        Ok(OutgoingMessage {
+            note: message.note,
+            body: response,
+        })
     }
-
-    fn process_vfs_req(&mut self, req: VfsRequest) {}
 }

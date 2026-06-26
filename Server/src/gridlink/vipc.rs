@@ -7,20 +7,20 @@ use super::{
     utils::{CursorExt, ReadExt},
 };
 
-#[derive(Clone, Debug)]
-pub struct IpcMessage<'a> {
-    pub note: u16,                // note
-    pub body: IpcMessageBody<'a>, // class + payload
-}
-
 #[derive(Clone, Copy, Debug, strum::FromRepr)]
 #[repr(u16)]
-enum IpcMessageClassType {
+enum MessageClassType {
     Vfs = 83,
 }
 
 #[derive(Clone, Debug)]
-pub enum IpcMessageBody<'a> {
+pub struct IncomingMessage<'a> {
+    pub note: u16,                     // note
+    pub body: IncomingMessageBody<'a>, // class + payload
+}
+
+#[derive(Clone, Debug)]
+pub enum IncomingMessageBody<'a> {
     Vfs(VfsRequest<'a>),
     Unsupported(&'a [u8]),
 }
@@ -40,7 +40,7 @@ pub struct VfsRequestHeader {
 
 #[derive(Clone, Copy, Debug, strum::FromRepr)]
 #[repr(u16)]
-enum VfsRequestCode {
+pub enum VfsRequestCode {
     GetStatus = 1,    // ddGetStatus
     Open = 2,         // ddOpen
     Close = 3,        // ddClose
@@ -109,16 +109,22 @@ pub struct VfsWriteRequest<'a> {
 }
 
 #[derive(Clone, Debug)]
-pub enum VfsResponse<'a> {
+pub struct OutgoingMessage {
+    pub note: u16,                 // note
+    pub body: OutgoingMessageBody, // class + payload
+}
+
+#[derive(Clone, Debug)]
+pub enum OutgoingMessageBody {
     // SimpleRespType
-    Simple(VfsSimpleResponse),
+    VfsSimple(VfsResponseHeader),
 
     // ReadRespType
-    Read(VfsReadResponse<'a>),
+    VfsRead(VfsReadResponse),
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct VfsSimpleResponse {
+pub struct VfsResponseHeader {
     pub response: u16,           // vfsResponse
     pub servers_conn_id: u16,    // serversConnID
     pub requestors_conn_id: u16, // requestorsConnID
@@ -126,13 +132,12 @@ pub struct VfsSimpleResponse {
 }
 
 #[derive(Clone, Debug)]
-pub struct VfsReadResponse<'a> {
-    pub common: VfsSimpleResponse, // VfsRespCommonPart
-    pub data_length: u16,          // vfsDatalength
-    pub data: &'a [u8],            // buffer
+pub struct VfsReadResponse {
+    pub common: VfsResponseHeader, // VfsRespCommonPart
+    pub data: Vec<u8>,             // vfsDatalength + buffer
 }
 
-impl<'a> IpcMessage<'a> {
+impl<'a> IncomingMessage<'a> {
     pub fn try_from_slice(data: &'a [u8]) -> Result<Self, FrameError> {
         let mut cursor = io::Cursor::new(data);
 
@@ -141,11 +146,13 @@ impl<'a> IpcMessage<'a> {
         let data_length = cursor.read_u16()? as usize;
         let payload = cursor.read_slice(data_length)?;
 
-        Self::ensure_empty(&cursor, "VIPC message")?;
+        Self::ensure_empty(&cursor, " message")?;
 
-        let body = match IpcMessageClassType::from_repr(class) {
-            Some(IpcMessageClassType::Vfs) => IpcMessageBody::Vfs(Self::read_vfs_request(payload)?),
-            None => IpcMessageBody::Unsupported(payload),
+        let body = match MessageClassType::from_repr(class) {
+            Some(MessageClassType::Vfs) => {
+                IncomingMessageBody::Vfs(Self::read_vfs_request(payload)?)
+            }
+            None => IncomingMessageBody::Unsupported(payload),
         };
 
         Ok(Self { note, body })
@@ -273,5 +280,51 @@ impl<'a> IpcMessage<'a> {
         Err(FrameError::Validation {
             reason: format!("{context}: {remaining} trailing bytes"),
         })
+    }
+}
+
+impl OutgoingMessage {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload_length = self.payload_length();
+
+        let mut data = Vec::with_capacity(6 + payload_length as usize);
+
+        data.extend(self.class().to_le_bytes());
+        data.extend(self.note.to_le_bytes());
+        data.extend(payload_length.to_le_bytes());
+
+        match &self.body {
+            OutgoingMessageBody::VfsSimple(response) => {
+                Self::write_header(&mut data, response);
+            }
+            OutgoingMessageBody::VfsRead(response) => {
+                Self::write_header(&mut data, &response.common);
+                data.extend((response.data.len() as u16).to_le_bytes());
+                data.extend_from_slice(&response.data);
+            }
+        }
+
+        data
+    }
+
+    fn class(&self) -> u16 {
+        match &self.body {
+            OutgoingMessageBody::VfsSimple(_) => MessageClassType::Vfs as u16,
+            OutgoingMessageBody::VfsRead(_) => MessageClassType::Vfs as u16,
+        }
+    }
+
+    fn payload_length(&self) -> u16 {
+        match &self.body {
+            OutgoingMessageBody::VfsSimple(_) => 8,
+            OutgoingMessageBody::VfsRead(response) => 10 + response.data.len() as u16,
+        }
+    }
+
+    fn write_header(dst: &mut Vec<u8>, header: &VfsResponseHeader) {
+        dst.extend(header.response.to_le_bytes());
+        dst.extend(header.servers_conn_id.to_le_bytes());
+        dst.extend(header.requestors_conn_id.to_le_bytes());
+        dst.extend(header.error.to_le_bytes());
     }
 }

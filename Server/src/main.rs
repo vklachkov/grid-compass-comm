@@ -6,7 +6,6 @@ use std::{
     io,
     net::{SocketAddr, TcpListener, TcpStream},
     process::ExitCode,
-    rc::Rc,
     thread,
 };
 
@@ -60,14 +59,13 @@ fn worker(client: TcpStream, addr: SocketAddr) {
 }
 
 fn try_worker(client: TcpStream, addr: SocketAddr) -> io::Result<()> {
-    let vfs = Rc::new(Box::new(Vfs::new()));
+    let vfs = Box::new(Vfs::new());
 
     let mut session = Session {
         client: client,
         // TODO: automatically choose the connection ID from the available IDs.
         connection_id: 0x7B,
         last_seq_number: 0x1C,
-        vfs: vfs.clone(),
         vipc: Box::new(Vipc::new(vfs)),
     };
 
@@ -98,7 +96,6 @@ struct Session {
     client: TcpStream,
     connection_id: u8,
     last_seq_number: u8,
-    vfs: Rc<Box<Vfs>>,
     vipc: Box<Vipc>,
 }
 
@@ -229,7 +226,17 @@ impl Session {
     }
 
     fn process_msg(&mut self, header: ConnectHeader, payload: &[u8]) -> Result<(), FrameError> {
-        self.vipc.process_message(header, payload)
+        let outgoing = self.vipc.process_message(payload)?;
+
+        let response = DataFrameResponse::Msg {
+            header: ConnectHeader {
+                local_path_id: header.remote_path_id,
+                remote_path_id: header.local_path_id,
+            },
+            payload: outgoing.to_bytes(),
+        };
+
+        self.write_response(&response.to_bytes())
     }
 
     fn write_response(&mut self, body: &[u8]) -> Result<(), FrameError> {

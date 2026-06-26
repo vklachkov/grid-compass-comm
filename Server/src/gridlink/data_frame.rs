@@ -85,7 +85,7 @@ pub enum DataFrameResponse<'a> {
 
     Msg {
         header: ConnectHeader,
-        payload: &'a [u8],
+        payload: Vec<u8>,
     },
 }
 
