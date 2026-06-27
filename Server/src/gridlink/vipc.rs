@@ -4,6 +4,7 @@ use bstr::BStr;
 
 use super::{
     error::FrameError,
+    path::Path,
     utils::{CursorExt, ReadExt},
 };
 
@@ -100,7 +101,7 @@ pub struct VfsAttachRequest<'a> {
     pub mode: u8,           // mode
     pub access: u8,         // access
     pub password: [u8; 17], // password
-    pub path: &'a BStr,
+    pub path: Path<'a>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,6 +224,12 @@ pub enum OutgoingMessageBody {
     // SimpleRespType
     VfsSimple(VfsResponseHeader),
 
+    // StatusType
+    VfsGetStatus(VfsGetStatusResponse),
+
+    // ReadRespType with DirectoryEntryType buffer
+    VfsReadDirPage(VfsReadDirPageResponse),
+
     // ReadRespType
     VfsRead(VfsReadResponse),
 }
@@ -236,9 +243,43 @@ pub struct VfsResponseHeader {
 }
 
 #[derive(Clone, Debug)]
+pub struct VfsGetStatusResponse {
+    pub header: VfsResponseHeader, // VfsRespCommonPart
+    pub open: bool,                // open
+    pub access: VfsAccessMode,     // access
+    pub seek: bool,                // seek
+    pub file_position: u32,        // filePosition
+    pub file_length: u32,          // fileLength
+    pub num_pages: u16,            // numPages
+    pub num_pages_alloc: u16,      // numPagesAlloc
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsReadDirPageResponse {
+    pub header: VfsResponseHeader,      // VfsRespCommonPart
+    pub entries: Vec<VfsShortDirEntry>, // vfsDatalength + DirectoryEntryType buffer
+}
+
+#[derive(Clone, Debug)]
 pub struct VfsReadResponse {
-    pub common: VfsResponseHeader, // VfsRespCommonPart
+    pub header: VfsResponseHeader, // VfsRespCommonPart
     pub data: Vec<u8>,             // vfsDatalength + buffer
+}
+
+#[derive(Clone, Debug)]
+pub struct VfsShortDirEntry {
+    pub name: Vec<u8>, // DirectoryEntryType.name
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum VfsAccessMode {
+    Read = 1,
+    Write = 2,
+    Update = 3,
+    UpdateDescriptor = 4,
+    ShortDirectory = 5,
+    LongDirectory = 6,
 }
 
 impl<'a> IncomingMessage<'a> {
@@ -330,7 +371,7 @@ impl<'a> IncomingMessage<'a> {
         let mode = cursor.read_u8()?;
         let access = cursor.read_u8()?;
         let password = cursor.read_array()?;
-        let path = Self::read_small_slice(cursor).map(BStr::new)?;
+        let path = Self::read_small_slice(cursor).and_then(Path::try_from_slice)?;
 
         Self::ensure_empty(cursor, "VFS attach payload")?;
 
@@ -455,8 +496,16 @@ impl OutgoingMessage {
             OutgoingMessageBody::VfsSimple(response) => {
                 Self::write_header(&mut data, response);
             }
+            OutgoingMessageBody::VfsGetStatus(response) => {
+                Self::write_header(&mut data, &response.header);
+                Self::write_status(&mut data, response);
+            }
+            OutgoingMessageBody::VfsReadDirPage(response) => {
+                Self::write_header(&mut data, &response.header);
+                Self::write_short_dir_entries(&mut data, &response.entries);
+            }
             OutgoingMessageBody::VfsRead(response) => {
-                Self::write_header(&mut data, &response.common);
+                Self::write_header(&mut data, &response.header);
                 data.extend((response.data.len() as u16).to_le_bytes());
                 data.extend_from_slice(&response.data);
             }
@@ -468,13 +517,20 @@ impl OutgoingMessage {
     fn class(&self) -> u16 {
         match &self.body {
             OutgoingMessageBody::VfsSimple(_) => MessageClassType::Vfs as u16,
+            OutgoingMessageBody::VfsGetStatus(_) => MessageClassType::Vfs as u16,
+            OutgoingMessageBody::VfsReadDirPage(_) => MessageClassType::Vfs as u16,
             OutgoingMessageBody::VfsRead(_) => MessageClassType::Vfs as u16,
         }
     }
 
     fn payload_length(&self) -> u16 {
+        // TODO: Remove magic numbers.
         match &self.body {
             OutgoingMessageBody::VfsSimple(_) => 8,
+            OutgoingMessageBody::VfsGetStatus(_) => 25,
+            OutgoingMessageBody::VfsReadDirPage(response) => {
+                10 + Self::short_dir_entries_len(&response.entries)
+            }
             OutgoingMessageBody::VfsRead(response) => 10 + response.data.len() as u16,
         }
     }
@@ -484,6 +540,39 @@ impl OutgoingMessage {
         dst.extend(header.servers_conn_id.to_le_bytes());
         dst.extend(header.requestors_conn_id.to_le_bytes());
         dst.extend(header.error.to_le_bytes());
+    }
+
+    fn write_status(dst: &mut Vec<u8>, response: &VfsGetStatusResponse) {
+        dst.extend(15u16.to_le_bytes()); // vfsDataLength
+        dst.push(response.open as u8);
+        dst.push(response.access as u8);
+        dst.push(response.seek as u8);
+        dst.extend(response.file_position.to_le_bytes());
+        dst.extend(response.file_length.to_le_bytes());
+        dst.extend(response.num_pages.to_le_bytes());
+        dst.extend(response.num_pages_alloc.to_le_bytes());
+    }
+
+    fn write_short_dir_entries(dst: &mut Vec<u8>, entries: &[VfsShortDirEntry]) {
+        dst.extend(Self::short_dir_entries_len(entries).to_le_bytes());
+
+        for entry in entries {
+            Self::write_short_dir_entry(dst, entry);
+        }
+    }
+
+    fn short_dir_entries_len(entries: &[VfsShortDirEntry]) -> u16 {
+        entries
+            .iter()
+            .map(|entry| 9 + entry.name.len() as u16)
+            .sum()
+    }
+
+    fn write_short_dir_entry(dst: &mut Vec<u8>, entry: &VfsShortDirEntry) {
+        dst.extend([0; 4]);
+        dst.extend((9 + entry.name.len() as u32).to_le_bytes());
+        dst.push(entry.name.len() as u8);
+        dst.extend_from_slice(&entry.name);
     }
 }
 

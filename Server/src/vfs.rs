@@ -2,12 +2,31 @@ use std::{collections::HashMap, num::NonZeroU16};
 
 use crate::gridlink::vipc::*;
 
+const RESOURCES: &[&str] = &["Hard Disk~FS~"];
+const HARD_DISK: &[&str] = &[
+    "Folder 1~Subject~",
+    "Folder 3~Subject~",
+    "Folder 2~Subject~",
+];
+const HARD_DISK_FILES: &[&str] = &["Demo file~Text~"];
+
 pub struct Vfs {
     connection_id: NonZeroU16,
     files: HashMap<NonZeroU16, VfsFileDescriptor>,
 }
 
-struct VfsFileDescriptor {}
+struct VfsFileDescriptor {
+    resource: VfsResource,
+    read_dir_page_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VfsResource {
+    Resources,
+    HardDisk,
+    HardDiskFiles,
+    Unknown,
+}
 
 impl Vfs {
     pub fn new() -> Self {
@@ -40,16 +59,21 @@ impl Vfs {
         header: &VfsRequestHeader,
         _body: VfsReadRequest,
     ) -> OutgoingMessageBody {
-        // TODO
-
-        OutgoingMessageBody::VfsRead(VfsReadResponse {
-            common: VfsResponseHeader {
+        OutgoingMessageBody::VfsGetStatus(VfsGetStatusResponse {
+            header: VfsResponseHeader {
                 response: 0x8000 | VfsRequestCode::GetStatus as u16,
                 servers_conn_id: header.servers_conn_id,
                 requestors_conn_id: header.requestors_conn_id,
                 error: 0, // Ok
             },
-            data: Vec::new(),
+            // FIXME: replace with real data
+            open: true,
+            access: VfsAccessMode::Read,
+            seek: true,
+            file_position: 0,
+            file_length: 0,
+            num_pages: 0,
+            num_pages_alloc: 0,
         })
     }
 
@@ -68,7 +92,7 @@ impl Vfs {
         // TODO
 
         OutgoingMessageBody::VfsRead(VfsReadResponse {
-            common: VfsResponseHeader {
+            header: VfsResponseHeader {
                 response: 0x8000 | VfsRequestCode::Read as u16,
                 servers_conn_id: header.servers_conn_id,
                 requestors_conn_id: header.requestors_conn_id,
@@ -86,7 +110,7 @@ impl Vfs {
         // TODO
 
         OutgoingMessageBody::VfsRead(VfsReadResponse {
-            common: VfsResponseHeader {
+            header: VfsResponseHeader {
                 response: 0x8000 | VfsRequestCode::ReadDesc as u16,
                 servers_conn_id: header.servers_conn_id,
                 requestors_conn_id: header.requestors_conn_id,
@@ -99,18 +123,21 @@ impl Vfs {
     fn read_dir_page(
         &mut self,
         header: &VfsRequestHeader,
-        _body: VfsReadRequest,
+        body: VfsReadRequest,
     ) -> OutgoingMessageBody {
-        // TODO
+        let entries = NonZeroU16::new(header.servers_conn_id)
+            .and_then(|conn_id| self.files.get_mut(&conn_id))
+            .map(|file| file.read_dir_page(body.data_length as usize))
+            .unwrap_or_default();
 
-        OutgoingMessageBody::VfsRead(VfsReadResponse {
-            common: VfsResponseHeader {
+        OutgoingMessageBody::VfsReadDirPage(VfsReadDirPageResponse {
+            header: VfsResponseHeader {
                 response: 0x8000 | VfsRequestCode::ReadDirPage as u16,
                 servers_conn_id: header.servers_conn_id,
                 requestors_conn_id: header.requestors_conn_id,
                 error: 0, // Ok
             },
-            data: Vec::new(),
+            entries,
         })
     }
 
@@ -173,7 +200,7 @@ impl Vfs {
     fn attach(
         &mut self,
         header: &VfsRequestHeader,
-        _body: VfsAttachRequest<'_>,
+        body: VfsAttachRequest<'_>,
     ) -> OutgoingMessageBody {
         let conn_id = self.connection_id;
 
@@ -184,7 +211,8 @@ impl Vfs {
         self.files.insert(
             conn_id,
             VfsFileDescriptor {
-                // TODO
+                resource: VfsResource::from_components(&body.path.components),
+                read_dir_page_offset: 0,
             },
         );
 
@@ -223,5 +251,51 @@ impl Vfs {
 
     fn unknown(&mut self, _body: &[u8]) -> OutgoingMessageBody {
         panic!("unsupported VFS request")
+    }
+}
+
+impl VfsFileDescriptor {
+    fn read_dir_page(&mut self, max_entries: usize) -> Vec<VfsShortDirEntry> {
+        let entries = match self.resource {
+            VfsResource::Resources => RESOURCES,
+            VfsResource::HardDisk => HARD_DISK,
+            VfsResource::HardDiskFiles => HARD_DISK_FILES,
+            VfsResource::Unknown => return Vec::new(),
+        };
+
+        let mut page = Vec::new();
+
+        for name in entries
+            .iter()
+            .skip(self.read_dir_page_offset)
+            .take(max_entries)
+        {
+            page.push(VfsShortDirEntry {
+                name: name.as_bytes().to_vec(),
+            });
+            self.read_dir_page_offset += 1;
+        }
+
+        page
+    }
+}
+
+impl VfsResource {
+    fn from_components(components: &[&bstr::BStr]) -> Self {
+        if components.len() == 2
+            && components[0] == b"Name Device"
+            && components[1] == b"Resources~Subject~"
+        {
+            Self::Resources
+        } else if components.len() == 1 && components[0] == b"Hard Disk" {
+            Self::HardDisk
+        } else if components.len() == 2
+            && components[0] == b"Hard Disk"
+            && components[1] == b"Folder 3~Subject~"
+        {
+            Self::HardDiskFiles
+        } else {
+            Self::Unknown
+        }
     }
 }
